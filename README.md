@@ -41,3 +41,30 @@ use sui::find_section;
 let data = find_section("_CUSTOM")
             .expect("Section not found");
 ```
+
+### Design
+
+**Windows**
+
+For PE executables, the resources are added into the `.rsrc` section,
+with the `RT_RCDATA` (raw data) type.
+
+The build-time equivalent is adding the binary data as a resource in
+the usual manner, such as the Resource Compiler, and marking it as
+`RT_RCDATA`.
+
+The run-time lookup uses the `FindResource` and `LoadResource` APIs.
+
+**macOS**
+
+For Mach-O executables, the resources are added as sections inside a
+new segment.
+
+The build-time equivalent of embedding binary data with this approach
+uses a linker flag: `-sectcreate,__FOO,__foo,content.txt`
+
+**Linux**
+
+For ELF executables, the resources are added as notes.
+
+The build-time equivalent is to use a linker script.
