@@ -25,6 +25,26 @@ Displaying notes found in:
 # on macOS
 $ codesign -s - ./deno_new
 $ otool -l ./deno_new | grep _SUI
+Load command 4
+      cmd LC_SEGMENT_64
+  cmdsize 152
+  segname __SUI
+   vmaddr 0x0000000100340000
+   vmsize 0x0000000000004000
+  fileoff 3407872
+ filesize 10
+  maxprot 0x00000001
+ initprot 0x00000001
+   nsects 1
+    flags 0x0
+Section
+  sectname __SUI
+   segname __SUI
+      addr 0x0000000100340000
+      size 0x000000000000000a
+    offset 3407872
+     align 2^0 (1)
+    reloff 0
 ```
 
 ### API
