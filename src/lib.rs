@@ -10,7 +10,7 @@ pub enum ExecutableFormat {
     Unknown,
 }
 
-type Write = extern "C" fn(*const c_void, usize, *const c_void) -> c_int;
+type Write = extern "C" fn(*const u8, usize, *const c_void) -> c_int;
 
 extern "C" { 
     #[link_name = "get_executable_format"]
@@ -58,15 +58,15 @@ pub fn get_executable_format(data: &[u8]) -> ExecutableFormat {
     }
 }
 
-type RustWrite = fn(&[u8]) -> Result<(), i32>;
+type RustWrite = Box<dyn Fn(&[u8]) -> Result<(), c_int>>;
 
-extern "C" fn cwrite(data: *const c_void, len: usize, user_data: *const c_void) -> c_int {
+extern "C" fn cwrite(data: *const u8, len: usize, user_data: *const c_void) -> c_int {
     let data = unsafe {
         std::slice::from_raw_parts(data as *const u8, len)
     };
 
     let write = unsafe {
-        &*(user_data as *const RustWrite)
+        Box::from_raw(user_data as *mut RustWrite)
     };
     write(data).map(|_| 0).unwrap_or_else(|e| e)
 }
@@ -84,7 +84,7 @@ pub fn inject_into_elf(executable: &[u8],
                         data.as_ptr(),
                         data.len(),
                         overwrite,
-                        write as *const RustWrite as *const c_void,
+                        Box::into_raw(Box::new(write)) as *const c_void,
                         cwrite)
     }
 }
@@ -105,7 +105,7 @@ pub fn inject_into_macho(executable: &[u8],
                           data.as_ptr(),
                           data.len(),
                           overwrite,
-                          write as *const RustWrite as *const c_void,
+                          Box::into_raw(Box::new(write)) as *const c_void,
                           cwrite)
     }
 }
@@ -123,7 +123,7 @@ pub fn inject_into_pe(executable: &[u8],
                        data.as_ptr(),
                        data.len(),
                        overwrite,
-                       write as *const RustWrite as *const c_void,
+                       Box::into_raw(Box::new(write)) as *const c_void,
                        cwrite)
     }
 }

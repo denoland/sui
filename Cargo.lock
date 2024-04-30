@@ -23,3 +23,10 @@ version = "0.0.0"
 dependencies = [
  "cmake",
 ]
+
+[[package]]
+name = "sui-cli"
+version = "0.1.0"
+dependencies = [
+ "sui",
+]

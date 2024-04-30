@@ -1,3 +1,4 @@
+workspace = { members = ["cli"] }
 [package]
 name = "sui"
 version = "0.0.0"
