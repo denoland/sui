@@ -1,7 +1,10 @@
-workspace = { members = ["cli"] }
 [package]
 name = "sui"
 version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+libc = "*"
 
 [build-dependencies]
 cmake = "0.1"
