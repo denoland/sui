@@ -1,10 +1,11 @@
+
+#include <LIEF/LIEF.hpp>
 #include <algorithm>
 #include <codecvt>
 #include <locale>
 #include <memory>
 #include <vector>
 
-#include <LIEF/LIEF.hpp>
 #include "sui.h"
 
 enum class InjectResult { kAlreadyExists, kError, kSuccess };
@@ -23,16 +24,12 @@ ExecutableFormat get_executable_format(const char* start, size_t length) {
   return ExecutableFormat::kUnknown;
 }
 
-int inject_into_elf(const uint8_t* executable_ptr,
-			size_t executable_size,
-                                const char* note_name_ptr,
-				size_t note_name_size,
-                                const uint8_t* data_ptr,
-				size_t data_size,
-                                bool overwrite,
-	  void* user_data,
-			Write write) {
-  std::vector<uint8_t> executable(executable_ptr, executable_ptr + executable_size);
+int inject_into_elf(const uint8_t* executable_ptr, size_t executable_size,
+                    const char* note_name_ptr, size_t note_name_size,
+                    const uint8_t* data_ptr, size_t data_size, bool overwrite,
+                    void* user_data, Write write) {
+  std::vector<uint8_t> executable(executable_ptr,
+                                  executable_ptr + executable_size);
   std::string note_name(note_name_ptr, note_name_ptr + note_name_size);
   std::vector<uint8_t> data(data_ptr, data_ptr + data_size);
 
@@ -68,20 +65,17 @@ int inject_into_elf(const uint8_t* executable_ptr,
   return write(output.data(), output.size(), user_data);
 }
 
-int inject_into_macho(const uint8_t* executable_ptr,
-			size_t executable_size,
-			const char* segment_name_ptr,
-			size_t segment_name_size,
-			const char* section_name_ptr,
-			size_t section_name_size,
-			const uint8_t* data_ptr,
-			size_t data_size,
-			bool overwrite,
-		  void* user_data,
-	Write write) {
-  std::vector<uint8_t> executable(executable_ptr, executable_ptr + executable_size);
-  std::string segment_name(segment_name_ptr, segment_name_ptr + segment_name_size);
-  std::string section_name(section_name_ptr, section_name_ptr + section_name_size);
+int inject_into_macho(const uint8_t* executable_ptr, size_t executable_size,
+                      const char* segment_name_ptr, size_t segment_name_size,
+                      const char* section_name_ptr, size_t section_name_size,
+                      const uint8_t* data_ptr, size_t data_size, bool overwrite,
+                      void* user_data, Write write) {
+  std::vector<uint8_t> executable(executable_ptr,
+                                  executable_ptr + executable_size);
+  std::string segment_name(segment_name_ptr,
+                           segment_name_ptr + segment_name_size);
+  std::string section_name(section_name_ptr,
+                           section_name_ptr + section_name_size);
   std::vector<uint8_t> data(data_ptr, data_ptr + data_size);
 
   std::unique_ptr<LIEF::MachO::FatBinary> fat_binary =
@@ -130,17 +124,14 @@ int inject_into_macho(const uint8_t* executable_ptr,
   return write(output.data(), output.size(), user_data);
 }
 
-int inject_into_pe(const uint8_t* executable_ptr,
-			size_t executable_size,
-			const char* resource_name_ptr,
-			size_t resource_name_size,
-			const uint8_t* data_ptr,
-			size_t data_size,
-			bool overwrite,
-			  void* user_data,
-Write write) {
-  std::vector<uint8_t> executable(executable_ptr, executable_ptr + executable_size);
-  std::string resource_name(resource_name_ptr, resource_name_ptr + resource_name_size);
+int inject_into_pe(const uint8_t* executable_ptr, size_t executable_size,
+                   const char* resource_name_ptr, size_t resource_name_size,
+                   const uint8_t* data_ptr, size_t data_size, bool overwrite,
+                   void* user_data, Write write) {
+  std::vector<uint8_t> executable(executable_ptr,
+                                  executable_ptr + executable_size);
+  std::string resource_name(resource_name_ptr,
+                            resource_name_ptr + resource_name_size);
   std::vector<uint8_t> data(data_ptr, data_ptr + data_size);
 
   std::unique_ptr<LIEF::PE::Binary> binary =
@@ -154,7 +145,7 @@ Write write) {
   // support so this is simpler?
 
   if (!binary->has_resources()) {
-    // error 
+    // error
   }
 
   LIEF::PE::ResourceNode* resources = binary->resources();
