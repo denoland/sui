@@ -2,7 +2,7 @@ Sui (सुई)
 
 Heavily modified fork of Postject. Available as a CLI tool and a Rust library.
 
-## CLI
+### CLI
 
 ```
 cargo install sui-cli
@@ -21,9 +21,9 @@ Displaying notes found in:
    description data: 73 6f 6d 65 20 74 65 78 74 0a
 ```
 
-## API
+### API
 
-### Injector
+Inject into existing Mach-O binary:
 ```rust
 use sui::inject_into_macho;
 
@@ -34,8 +34,7 @@ inject_into_macho(&executable, "__CUSTOM", "__custom", "Hello, World!", |data| {
 })?;
 ```
 
-## Extractor
-
+Extract from itself:
 ```rust
 use sui::find_section;
 
