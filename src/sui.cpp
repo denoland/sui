@@ -5,12 +5,13 @@
 #include <vector>
 
 #include <LIEF/LIEF.hpp>
-
-enum class ExecutableFormat { kELF, kMachO, kPE, kUnknown };
+#include "sui.h"
 
 enum class InjectResult { kAlreadyExists, kError, kSuccess };
 
-ExecutableFormat get_executable_format(std::vector<uint8_t> buffer) {
+ExecutableFormat get_executable_format(const char* start, size_t length) {
+  std::vector<uint8_t> buffer(start, start + length);
+
   if (LIEF::ELF::is_elf(buffer)) {
     return ExecutableFormat::kELF;
   } else if (LIEF::MachO::is_macho(buffer)) {
@@ -22,10 +23,19 @@ ExecutableFormat get_executable_format(std::vector<uint8_t> buffer) {
   return ExecutableFormat::kUnknown;
 }
 
-std::vector<uint8_t> inject_into_elf(const std::vector<uint8_t>& executable,
-                                const std::string& note_name,
-                                const std::vector<uint8_t>& data,
-                                bool overwrite = false) {
+int inject_into_elf(const uint8_t* executable_ptr,
+			size_t executable_size,
+                                const char* note_name_ptr,
+				size_t note_name_size,
+                                const uint8_t* data_ptr,
+				size_t data_size,
+                                bool overwrite,
+	  void* user_data,
+			Write write) {
+  std::vector<uint8_t> executable(executable_ptr, executable_ptr + executable_size);
+  std::string note_name(note_name_ptr, note_name_ptr + note_name_size);
+  std::vector<uint8_t> data(data_ptr, data_ptr + data_size);
+
   std::unique_ptr<LIEF::ELF::Binary> binary =
       LIEF::ELF::Parser::parse(executable);
 
@@ -54,14 +64,26 @@ std::vector<uint8_t> inject_into_elf(const std::vector<uint8_t>& executable,
   note.description(data);
   binary->add(note);
 
-  return binary->raw();
+  std::vector<uint8_t> output = binary->raw();
+  return write(output.data(), output.size(), user_data);
 }
 
-std::vector<uint8_t> inject_into_macho(std::vector<uint8_t> executable,
-                                  const std::string& segment_name,
-                                  const std::string& section_name,
-                                  const std::vector<uint8_t>& data,
-                                  bool overwrite = false) {
+int inject_into_macho(const uint8_t* executable_ptr,
+			size_t executable_size,
+			const char* segment_name_ptr,
+			size_t segment_name_size,
+			const char* section_name_ptr,
+			size_t section_name_size,
+			const uint8_t* data_ptr,
+			size_t data_size,
+			bool overwrite,
+		  void* user_data,
+	Write write) {
+  std::vector<uint8_t> executable(executable_ptr, executable_ptr + executable_size);
+  std::string segment_name(segment_name_ptr, segment_name_ptr + segment_name_size);
+  std::string section_name(section_name_ptr, section_name_ptr + section_name_size);
+  std::vector<uint8_t> data(data_ptr, data_ptr + data_size);
+
   std::unique_ptr<LIEF::MachO::FatBinary> fat_binary =
       LIEF::MachO::Parser::parse(executable);
 
@@ -104,13 +126,23 @@ std::vector<uint8_t> inject_into_macho(std::vector<uint8_t> executable,
     }
   }
 
-  return fat_binary->raw();
+  std::vector<uint8_t> output = fat_binary->raw();
+  return write(output.data(), output.size(), user_data);
 }
 
-std::vector<uint8_t> inject_into_pe(const std::vector<uint8_t>& executable,
-                               const std::string& resource_name,
-                               const std::vector<uint8_t>& data,
-                               bool overwrite = false) {
+int inject_into_pe(const uint8_t* executable_ptr,
+			size_t executable_size,
+			const char* resource_name_ptr,
+			size_t resource_name_size,
+			const uint8_t* data_ptr,
+			size_t data_size,
+			bool overwrite,
+			  void* user_data,
+Write write) {
+  std::vector<uint8_t> executable(executable_ptr, executable_ptr + executable_size);
+  std::string resource_name(resource_name_ptr, resource_name_ptr + resource_name_size);
+  std::vector<uint8_t> data(data_ptr, data_ptr + data_size);
+
   std::unique_ptr<LIEF::PE::Binary> binary =
       LIEF::PE::Parser::parse(executable);
 
@@ -212,6 +244,7 @@ std::vector<uint8_t> inject_into_pe(const std::vector<uint8_t>& executable,
   builder2.build_tls(false);
   builder2.build();
 
-  return builder2.get_build();
+  std::vector<uint8_t> output = builder2.get_build();
+  return write(output.data(), output.size(), user_data);
 }
 
