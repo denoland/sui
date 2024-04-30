@@ -3,14 +3,41 @@ use std::os::raw::{c_char, c_int, c_uchar};
 
 #[cfg(target_os = "windows")]
 mod pe {
+    use std::ffi::CString;
+
     pub fn find_section(section_name: &str) -> Option<&[u8]> {
-        None
+        let section_name = CString::new(section_name.to_uppercase()).unwrap();
+
+        unsafe {
+            let resource_handle = FindResourceA(std::ptr::null_mut(), section_name.as_ptr(), 10);
+            if resource_handle.is_null() {
+                return None;
+            }
+
+            let resource_data = LoadResource(std::ptr::null_mut(), resource_handle);
+            if resource_data.is_null() {
+                return None;
+            }
+
+            let resource_size = SizeofResource(std::ptr::null_mut(), resource_handle);
+            if resource_size == 0 {
+                return None;
+            }
+
+            let resource_ptr = LockResource(resource_data);
+            Some(std::slice::from_raw_parts(
+                resource_ptr as *const u8,
+                resource_size as usize,
+            ))
+        }
     }
 }
 
 #[cfg(target_os = "macos")]
 mod macho {
+    use std::ffi::CString;
     use std::os::raw::c_char;
+
     extern "C" {
         pub fn getsectdata(
             segname: *const c_char,
@@ -23,7 +50,13 @@ mod macho {
 
     pub fn find_section(section_name: &str) -> Option<&[u8]> {
         let mut section_size: usize = 0;
-        let segment_name = "__SUI";
+        let segment_name = "__SUI\0";
+        let section_name = if section_name.starts_with("__") {
+            section_name.to_string()
+        } else {
+            format!("__{}", section_name)
+        };
+        let section_name = CString::new(section_name).unwrap();
 
         unsafe {
             let mut ptr = getsectdata(
