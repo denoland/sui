@@ -13,12 +13,18 @@ $ cp $(command -v deno) .
 $ echo "Hello, World!" > hello.txt
 
 $ sui ./deno _SUI hello.txt ./deno_new
+
+# on Linux
 $ readelf -n ./deno_new
 
 Displaying notes found in:
   Owner                Data size 	Description
   _SUI                 0x0000000a	Unknown note type: (0x00000000)
    description data: 73 6f 6d 65 20 74 65 78 74 0a
+
+# on macOS
+$ codesign -s - ./deno_new
+$ otool -l ./deno_new | grep _SUI
 ```
 
 ### API

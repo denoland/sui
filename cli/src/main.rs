@@ -1,14 +1,14 @@
 use sui::ExecutableFormat;
 use sui::find_section;
 
-const HELP: &str = r#"
-Usage: sui <exe> <segment> <data_file> <output>
-"#;
+const HELP: &str = r#"Usage: sui <exe> <segment> <data_file> <output>"#;
 
 fn main() {
   let args: Vec<String> = std::env::args().collect();
   if args.len() != 5 {
-    let section = find_section("_SUI").unwrap();
+    if let Some(section) = find_section("__SUI\0") {
+        println!("Found section: {:?}", section);
+    }
     eprintln!("{}", HELP);
     std::process::exit(1);
   }
