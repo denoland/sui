@@ -17,7 +17,7 @@
 #define LIEF_DEX_CODE_INFO_H_
 #include "LIEF/visibility.h"
 #include "LIEF/Object.hpp"
-
+#include <cstdint>
 
 namespace LIEF {
 namespace DEX {

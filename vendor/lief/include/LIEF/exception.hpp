@@ -19,6 +19,7 @@
 #include <exception>
 #include <stdexcept>
 #include <string>
+#include <cstdint>
 
 #include "LIEF/visibility.h"
 

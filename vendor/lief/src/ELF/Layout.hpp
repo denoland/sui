@@ -17,6 +17,8 @@
 #include <unordered_map>
 #include <string>
 #include <vector>
+#include <cstdint>
+
 namespace LIEF {
 namespace ELF {
 class Section;

@@ -15,6 +15,7 @@
  */
 #include <algorithm>
 #include <iostream>
+#include <cstdint>
 
 #include "LIEF/Abstract/Symbol.hpp"
 
