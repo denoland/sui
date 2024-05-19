@@ -1,5 +1,5 @@
-use sui::find_section;
-use sui::ExecutableFormat;
+use libsui::find_section;
+use libsui::ExecutableFormat;
 
 const HELP: &str = r#"Usage: sui <exe> <segment> <data_file> <output>"#;
 
@@ -22,15 +22,15 @@ fn main() {
         Ok(())
     };
 
-    match sui::get_executable_format(&exe) {
+    match libsui::get_executable_format(&exe) {
         ExecutableFormat::ELF => {
-            sui::inject_into_elf(&exe, &args[2], &data, true, Box::new(writer));
+            libsui::inject_into_elf(&exe, &args[2], &data, true, Box::new(writer));
         }
         ExecutableFormat::MachO => {
-            sui::inject_into_macho(&exe, &args[2], &args[2], &data, true, Box::new(writer));
+            libsui::inject_into_macho(&exe, &args[2], &args[2], &data, true, Box::new(writer));
         }
         ExecutableFormat::PE => {
-            sui::inject_into_pe(&exe, &args[2], &data, true, Box::new(writer));
+            libsui::inject_into_pe(&exe, &args[2], &data, true, Box::new(writer));
         }
         _ => {
             eprintln!("Unknown executable format");

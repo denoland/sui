@@ -11,7 +11,7 @@
         </p>
         <p>
           <code>
-cargo add sui
+cargo add libsui
           </code>
         </p>
 
@@ -34,13 +34,13 @@ Displaying notes found in:
 
         <pre>
 let executable = std::fs::read("executable")?;
-sui::inject_into_macho(&executable, "__CUSTOM", "__custom", "Hello, World!", |data| {
+libsui::inject_into_macho(&executable, "__CUSTOM", "__custom", "Hello, World!", |data| {
   std::fs::write("executable", data);
   Ok(())
 })?;</pre>
 
 	<p>Extract data at runtime:</p>
-	<pre>let data = sui::find_section("_CUSTOM")?;</pre>
+	<pre>let data = libsui::find_section("_CUSTOM")?;</pre>
 
         <h2>Design</h2>
        
