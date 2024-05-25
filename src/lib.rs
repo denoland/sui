@@ -97,9 +97,9 @@ mod elf {
     use std::mem::size_of;
     use std::os::raw::{c_char, c_int, c_void};
 
-    unsafe extern "C" fn sui__dl_iterate_phdr_callback(
+    unsafe extern "C" fn sui_dl_iterate_phdr_callback(
         info: *mut dl_phdr_info,
-        size: usize,
+        _size: usize,
         data: *mut c_void,
     ) -> c_int {
         // Snag the dl_phdr_info struct then stop iterating.
@@ -119,7 +119,7 @@ mod elf {
         unsafe {
             let mut main_program_info: dl_phdr_info = std::mem::zeroed();
             dl_iterate_phdr(
-                Some(sui__dl_iterate_phdr_callback),
+                Some(sui_dl_iterate_phdr_callback),
                 &mut main_program_info as *mut dl_phdr_info as *mut c_void,
             );
 
@@ -127,7 +127,6 @@ mod elf {
             let mut n = main_program_info.dlpi_phnum as usize;
             let base = main_program_info.dlpi_addr as usize;
 
-            let mut size = 0;
             loop {
                 if n <= 0 {
                     break;
@@ -151,7 +150,7 @@ mod elf {
                                 elf_section_name.len(),
                             ) == 0
                         {
-                            size = (*note).n_descsz as usize;
+                            let size = (*note).n_descsz as usize;
 
                             let data = pos
                                 + size_of::<Elf64_Nhdr>()
@@ -235,12 +234,12 @@ pub fn get_executable_format(data: &[u8]) -> ExecutableFormat {
     unsafe { c_get_executable_format(data.as_ptr(), data.len()) }
 }
 
-type RustWrite = Box<dyn Fn(&[u8]) -> Result<(), c_int>>;
+type RustWrite = Box<dyn FnMut(&[u8]) -> Result<(), c_int>>;
 
 extern "C" fn cwrite(data: *const u8, len: usize, user_data: *const c_void) -> c_int {
     let data = unsafe { std::slice::from_raw_parts(data as *const u8, len) };
 
-    let write = unsafe { Box::from_raw(user_data as *mut RustWrite) };
+    let mut write = unsafe { Box::from_raw(user_data as *mut RustWrite) };
     write(data).map(|_| 0).unwrap_or_else(|e| e)
 }
 
