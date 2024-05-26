@@ -1,4 +1,3 @@
-
 #include <LIEF/LIEF.hpp>
 #include <algorithm>
 #include <codecvt>
@@ -12,6 +11,7 @@ enum class InjectResult { kAlreadyExists, kError, kSuccess };
 
 ExecutableFormat get_executable_format(const char* start, size_t length) {
   std::vector<uint8_t> buffer(start, start + length);
+  LIEF::logging::disable();
 
   if (LIEF::ELF::is_elf(buffer)) {
     return ExecutableFormat::kELF;
