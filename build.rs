@@ -4,17 +4,17 @@ use std::path::PathBuf;
 fn main() {
     if cfg!(target_os = "windows") {
         download_prebuilt();
-        return;
+    } else {
+        let mut config = cmake::Config::new(".");
+        config
+            .define("BUILD_SHARED_LIBS", "OFF")
+            .define("CMAKE_BUILD_TYPE", "Release");
+        let dst = config.build();
+
+        println!("cargo:rustc-link-search=native={}/build", dst.display());
+        println!("cargo:rustc-link-search=native={}/lib", dst.display());
     }
 
-    let mut config = cmake::Config::new(".");
-    config
-        .define("BUILD_SHARED_LIBS", "OFF")
-        .define("CMAKE_BUILD_TYPE", "Release");
-    let dst = config.build();
-
-    println!("cargo:rustc-link-search=native={}/build", dst.display());
-    println!("cargo:rustc-link-search=native={}/lib", dst.display());
     println!("cargo:rustc-link-lib=static=LIEF");
     println!("cargo:rustc-link-lib=static=sui");
 
@@ -40,14 +40,22 @@ fn download_prebuilt() {
     _ => {}
   };
 
-  let curl = std::process::Command::new("curl")
+  let sui_lib = std::process::Command::new("curl")
     .arg("-L")
     .arg("-o")
-    .arg(out_dir.join("sui.lib.gz"))
+    .arg(out_dir.join("sui.lib"))
     .arg(url)
     .status()
     .expect("Failed to download prebuilt lib");
-  assert!(curl.success());
+  assert!(sui_lib.success());
+  let lief_lib = std::process::Command::new("curl")
+    .arg("-L")
+    .arg("-o")
+    .arg(out_dir.join("LIEF.lib"))
+    .arg(url)
+    .status()
+    .expect("Failed to download prebuilt lib");
+  assert!(lief_lib.success());
 
   std::fs::write(static_checksum_path(), url).unwrap();
 }
