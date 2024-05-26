@@ -18,23 +18,25 @@ fn main() {
 
     let out = args[4].clone();
     let writer = move |data: &[u8]| {
+        println!("Writing to {}", out);
         std::fs::write(&out, data).unwrap();
         Ok(())
     };
 
-    match libsui::get_executable_format(&exe) {
-        ExecutableFormat::ELF => {
-            libsui::inject_into_elf(&exe, &args[2], &data, true, Box::new(writer));
-        }
-        ExecutableFormat::MachO => {
-            libsui::inject_into_macho(&exe, &args[2], &args[2], &data, true, Box::new(writer));
-        }
-        ExecutableFormat::PE => {
-            libsui::inject_into_pe(&exe, &args[2], &data, true, Box::new(writer));
-        }
-        _ => {
-            eprintln!("Unknown executable format");
-            std::process::exit(1);
-        }
-    }
+    let ret = libsui::inject_into_pe(&exe, &args[2], &data, true, Box::new(writer));
+    dbg!(ret);
+    // match libsui::get_executable_format(&exe) {
+    //     ExecutableFormat::ELF => {
+    //         libsui::inject_into_elf(&exe, &args[2], &data, true, Box::new(writer));
+    //     }
+    //     ExecutableFormat::MachO => {
+    //         libsui::inject_into_macho(&exe, &args[2], &args[2], &data, true, Box::new(writer));
+    //     }
+    //     ExecutableFormat::PE => {
+    //     }
+    //     _ => {
+    //         eprintln!("Unknown executable format");
+    //         std::process::exit(1);
+    //     }
+    // }
 }

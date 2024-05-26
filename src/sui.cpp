@@ -138,14 +138,16 @@ int inject_into_pe(const uint8_t* executable_ptr, size_t executable_size,
       LIEF::PE::Parser::parse(executable);
 
   if (!binary) {
-    // error
+    std::cout << "Failed to parse binary\n";
+    return -1;
   }
 
   // TODO - lief.PE.ResourcesManager doesn't support RCDATA it seems, add
   // support so this is simpler?
 
   if (!binary->has_resources()) {
-    // error
+    std::cout << "No resources\n";
+    return -1;
   }
 
   LIEF::PE::ResourceNode* resources = binary->resources();
@@ -195,6 +197,8 @@ int inject_into_pe(const uint8_t* executable_ptr, size_t executable_size,
   if (id_node->childs() != std::end(id_node->childs())) {
     if (!overwrite) {
       // error
+      std::cout << "Resource already exists and overwrite is false\n";
+      return -1;
     }
 
     id_node->delete_child(*id_node->childs());

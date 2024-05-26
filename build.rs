@@ -113,7 +113,7 @@ fn static_lib_url() -> (String, String) {
   let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
   // Note: we always use the release build on windows.
   if target_os == "windows" {
-    return (format!("{}/v{}/sui.lib", base, version), format!("{}/v{}/LIEF.lib", base, version));
+    return (format!("{}/{}/sui.lib", base, version), format!("{}/{}/LIEF.lib", base, version));
   }
 
   unimplemented!()
