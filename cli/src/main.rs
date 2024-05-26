@@ -23,20 +23,18 @@ fn main() {
         Ok(())
     };
 
-    let ret = libsui::inject_into_pe(&exe, &args[2], &data, true, Box::new(writer));
-    dbg!(ret);
-    // match libsui::get_executable_format(&exe) {
-    //     ExecutableFormat::ELF => {
-    //         libsui::inject_into_elf(&exe, &args[2], &data, true, Box::new(writer));
-    //     }
-    //     ExecutableFormat::MachO => {
-    //         libsui::inject_into_macho(&exe, &args[2], &args[2], &data, true, Box::new(writer));
-    //     }
-    //     ExecutableFormat::PE => {
-    //     }
-    //     _ => {
-    //         eprintln!("Unknown executable format");
-    //         std::process::exit(1);
-    //     }
-    // }
+    match libsui::get_executable_format(&exe) {
+        ExecutableFormat::ELF => {
+            libsui::inject_into_elf(&exe, &args[2], &data, true, Box::new(writer));
+        }
+        ExecutableFormat::MachO => {
+            libsui::inject_into_macho(&exe, &args[2], &args[2], &data, true, Box::new(writer));
+        }
+        ExecutableFormat::PE => {
+        }
+        _ => {
+            eprintln!("Unknown executable format");
+            std::process::exit(1);
+        }
+    }
 }
