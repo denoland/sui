@@ -20,8 +20,8 @@ jobs:
     - name: Copy artifacts
       run: |
         mkdir artifacts
-        cp build/lib/LIEF.lib artifacts/
-        cp build/build/sui.lib artifacts/
+        cp build\vendor\lief\Release\LIEF.lib artifacts/
+        cp build\Release\sui.lib artifacts/
     - name: Binary publish
       uses: softprops/action-gh-release@v1
       with:
