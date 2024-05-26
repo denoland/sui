@@ -25,7 +25,7 @@ fn main() {
 }
 
 fn download_prebuilt() {
-  let url = static_lib_url();
+  let (url, lief_url) = static_lib_url();
   println!("Downloading prebuilt lib from {}", url);
 
   let out_dir = static_lib_dir();
@@ -44,7 +44,7 @@ fn download_prebuilt() {
     .arg("-L")
     .arg("-o")
     .arg(out_dir.join("sui.lib"))
-    .arg(url)
+    .arg(url.clone())
     .status()
     .expect("Failed to download prebuilt lib");
   assert!(sui_lib.success());
@@ -52,7 +52,7 @@ fn download_prebuilt() {
     .arg("-L")
     .arg("-o")
     .arg(out_dir.join("LIEF.lib"))
-    .arg(url)
+    .arg(lief_url)
     .status()
     .expect("Failed to download prebuilt lib");
   assert!(lief_lib.success());
@@ -104,7 +104,7 @@ fn build_dir() -> PathBuf {
 }
 
 
-fn static_lib_url() -> String {
+fn static_lib_url() -> (String, String) {
   let default_base = "https://github.com/littledivy/sui/releases/download";
   let base =
     env::var("SUI_MIRROR").unwrap_or_else(|_| default_base.into());
@@ -113,7 +113,7 @@ fn static_lib_url() -> String {
   let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
   // Note: we always use the release build on windows.
   if target_os == "windows" {
-    return format!("{}/v{}/sui_release_{}.lib.gz", base, version, target);
+    return (format!("{}/v{}/sui.lib", base, version), format!("{}/v{}/LIEF.lib", base, version));
   }
 
   unimplemented!()
