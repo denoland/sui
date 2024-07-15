@@ -61,9 +61,8 @@ pub fn find_section(elf_section_name: &str) -> Option<&[u8]> {
                     {
                         let size = (*note).n_descsz as usize;
 
-                        let data = pos
-                            + size_of::<Elf64_Nhdr>()
-                            + roundup((*note).n_namesz as usize, 4);
+                        let data =
+                            pos + size_of::<Elf64_Nhdr>() + roundup((*note).n_namesz as usize, 4);
                         return Some(std::slice::from_raw_parts(data as *const u8, size));
                     }
 
@@ -80,4 +79,3 @@ pub fn find_section(elf_section_name: &str) -> Option<&[u8]> {
         None
     }
 }
-
