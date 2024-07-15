@@ -4,7 +4,10 @@ use std::path::PathBuf;
 fn main() {
     if cfg!(target_os = "windows") {
         download_prebuilt();
-    } else {
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
         let mut config = cmake::Config::new(".");
         config
             .define("BUILD_SHARED_LIBS", "OFF")
