@@ -31,6 +31,7 @@ fn main() {
             libsui::inject_into_macho(&exe, &args[2], &args[2], &data, true, Box::new(writer));
         }
         ExecutableFormat::PE => {
+            libsui::inject_into_pe(&exe, &args[2], &data, true, Box::new(writer));
         }
         _ => {
             eprintln!("Unknown executable format");
