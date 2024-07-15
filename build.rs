@@ -109,7 +109,6 @@ fn static_lib_url() -> (String, String) {
   let base =
     env::var("SUI_MIRROR").unwrap_or_else(|_| default_base.into());
   let version = env::var("CARGO_PKG_VERSION").unwrap();
-  let target = env::var("TARGET").unwrap();
   let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
   // Note: we always use the release build on windows.
   if target_os == "windows" {
