@@ -1,6 +1,6 @@
 [package]
 name = "libsui"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 license = "MIT"
 description = "A injection tool for executable formats (ELF, PE, Mach-O) that allows you to embed files into existing binary and extract them at runtime"
@@ -15,4 +15,3 @@ windows-sys = { version = "0.48.0", features = ["Win32_System", "Win32_System_Li
 
 [target.'cfg(not(windows))'.build-dependencies]
 cmake = "0.1"
-
