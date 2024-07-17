@@ -14,10 +14,6 @@ option(LIEF_LOGGING "Enable logging" OFF)
 option(LIEF_OAT "Enable OAT support" OFF)
 option(LIEF_VDEX "Enable VDEX support" OFF)
 
-if(MSVC)
-  set(LIEF_USE_CRT_RELEASE "MT" CACHE STRING "LIEF CRT option")
-endif()
-
 add_subdirectory(vendor/lief)
 
 add_library(sui src/sui.h src/sui.cpp)
