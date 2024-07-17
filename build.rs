@@ -12,6 +12,7 @@ fn main() {
         config
             .define("BUILD_SHARED_LIBS", "OFF")
             .define("CMAKE_BUILD_TYPE", "Release");
+            .static_crt(true);
         let dst = config.build();
 
         println!("cargo:rustc-link-search=native={}/build", dst.display());

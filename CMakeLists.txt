@@ -18,9 +18,5 @@ add_subdirectory(vendor/lief)
 
 add_library(sui src/sui.h src/sui.cpp)
 
-if(MSVC)
-  set_property(TARGET sui PROPERTY LINK_FLAGS /NODEFAULTLIB:MSVCRT)
-endif()
-
 target_link_libraries(sui PRIVATE LIEF::LIEF)
 
