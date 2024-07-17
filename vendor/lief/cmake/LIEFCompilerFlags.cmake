@@ -65,7 +65,7 @@ if (NOT MSVC)
 
 
   ADD_FLAG_IF_SUPPORTED("-fdiagnostics-color=always" DIAGNOSTICS_COLOR)
-  ADD_FLAG_IF_SUPPORTED("-fcolor-diagnostics"        COLOR_DIAGNOSTICS)
+  # ADD_FLAG_IF_SUPPORTED("-fcolor-diagnostics"        COLOR_DIAGNOSTICS)
 endif()
 
 #ADD_FLAG_IF_SUPPORTED("-Wduplicated-cond"         HAS_DUPLICATED_COND)
