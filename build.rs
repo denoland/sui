@@ -2,12 +2,10 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
-    if cfg!(target_os = "windows") {
+    let from_source = env::var("SUI_FROM_SOURCE").is_ok();
+    if cfg!(target_os = "windows") && !from_source {
         download_prebuilt();
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
+    } else {
         let mut config = cmake::Config::new(".");
         config
             .define("BUILD_SHARED_LIBS", "OFF")
