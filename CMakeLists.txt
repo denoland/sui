@@ -13,8 +13,14 @@ option(LIEF_ART "Enable ART support" OFF)
 option(LIEF_LOGGING "Enable logging" OFF)
 option(LIEF_OAT "Enable OAT support" OFF)
 option(LIEF_VDEX "Enable VDEX support" OFF)
+option(LIEF_USE_CRT_DEBUG MTd)
+option(LIEF_USE_CRT_RELEASE MT)
 
 add_subdirectory(vendor/lief)
+
+if(MSVS)
+	set_property(TARGET sui PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
 
 add_library(sui src/sui.h src/sui.cpp)
 
