@@ -18,11 +18,11 @@ option(LIEF_USE_CRT_RELEASE MT)
 
 add_subdirectory(vendor/lief)
 
+add_library(sui src/sui.h src/sui.cpp)
+
 if(MSVC)
 	set_property(TARGET sui PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
-
-add_library(sui src/sui.h src/sui.cpp)
 
 target_link_libraries(sui PRIVATE LIEF::LIEF)
 
