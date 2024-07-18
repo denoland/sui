@@ -30,7 +30,7 @@ fn main() {
     }
 
     if cfg!(target_os = "windows") {
-        println!("cargo:rustc-link-lib=static=LIEFMT");
+        println!("cargo:rustc-link-lib=static=LIEF");
     } else {
         println!("cargo:rustc-link-lib=static=LIEF");
     }
