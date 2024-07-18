@@ -39,7 +39,10 @@ fn main() {
     println!("cargo:rustc-link-lib=static=sui");
 
     #[cfg(target_os = "linux")]
-    println!("cargo:rustc-link-lib=dylib=stdc++");
+    {
+      println!("cargo:rustc-link-lib=dylib=stdc++");
+      println!("cargo:rustc-link-lib=dylib=c_nonshared");
+    }
     #[cfg(target_os = "macos")]
     println!("cargo:rustc-link-lib=dylib=c++");
 }
