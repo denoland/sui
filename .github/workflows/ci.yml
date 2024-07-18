@@ -20,6 +20,9 @@ jobs:
 
     steps:
     - uses: actions/checkout@v3
+    - name: Setup upterm session
+      uses: lhotari/action-upterm@v1
+      if: matrix.os == 'windows-latest'
     - name: Build
       run: cargo b -vv
     - name: Build cli

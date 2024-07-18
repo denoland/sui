@@ -32,13 +32,8 @@ fn main() {
         println!("cargo:rustc-link-search=native={}", lief_lib_path.to_str().unwrap());
     }
 
-    if cfg!(target_os = "windows") {
-        println!("cargo:rustc-link-lib=static=LIEF");
-        println!("cargo:rustc-link-lib=static=libsui");
-    } else {
-        println!("cargo:rustc-link-lib=static=LIEF");
-        println!("cargo:rustc-link-lib=static=sui");
-    }
+    println!("cargo:rustc-link-lib=static=LIEF");
+    println!("cargo:rustc-link-lib=static=sui");
 
     #[cfg(target_os = "linux")]
     println!("cargo:rustc-link-lib=dylib=stdc++");
