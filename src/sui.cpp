@@ -7,6 +7,10 @@
 
 #include "sui.h"
 
+// __libc_single_threaded not defined in older GLIBC versions
+__attribute__((weak))
+char __libc_single_threaded = 0;
+
 enum class InjectResult { kAlreadyExists, kError, kSuccess };
 
 ExecutableFormat get_executable_format(const char* start, size_t length) {
