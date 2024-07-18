@@ -9,6 +9,7 @@ fn main() {
         let mut config = cmake::Config::new(".");
         config
             .define("BUILD_SHARED_LIBS", "OFF")
+            .define("LIEF_USE_CRT_RELEASE", "MT")
             .define("CMAKE_BUILD_TYPE", "Release")
             .static_crt(true);
         let dst = config.build();
