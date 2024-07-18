@@ -34,10 +34,11 @@ fn main() {
 
     if cfg!(target_os = "windows") {
         println!("cargo:rustc-link-lib=static=LIEF");
+        println!("cargo:rustc-link-lib=static=libsui");
     } else {
         println!("cargo:rustc-link-lib=static=LIEF");
+        println!("cargo:rustc-link-lib=static=sui");
     }
-    println!("cargo:rustc-link-lib=static=sui");
 
     #[cfg(target_os = "linux")]
     println!("cargo:rustc-link-lib=dylib=stdc++");
