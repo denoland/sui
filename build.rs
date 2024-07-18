@@ -24,6 +24,9 @@ fn main() {
 
         let lib_path = dst.join("build").join("lib");
         println!("cargo:rustc-link-search=native={}", lib_path.display());
+
+        let lief_lib_path = dst.join("build").join("LIEF").join("lib");
+        println!("cargo:rustc-link-search=native={}", lief_lib_path.to_str().unwrap());
     }
 
     if cfg!(target_os = "windows") {
