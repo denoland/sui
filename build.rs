@@ -25,9 +25,9 @@ fn main() {
         let lib_path = dst.join("build").join("lib");
         println!("cargo:rustc-link-search=native={}", lib_path.display());
         // On windows, a new folder is created for the static lib
-        let lib_path = dst.join("lib").join("Release");
+        let lib_path = dst.join("build").join("Release");
         println!("cargo:rustc-link-search=native={}", lib_path.display());
-        let lib_path = dst.join("lib").join("Debug");
+        let lib_path = dst.join("build").join("Debug");
         println!("cargo:rustc-link-search=native={}", lib_path.display());
 
         let lief_lib_path = dst.join("build").join("LIEF").join("lib");
