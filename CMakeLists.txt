@@ -18,7 +18,7 @@ option(LIEF_USE_CRT_RELEASE MT)
 
 add_subdirectory(vendor/lief)
 
-if(MSVS)
+if(MSVC)
 	set_property(TARGET sui PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
