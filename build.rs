@@ -10,8 +10,8 @@ fn main() {
         config
             .define("BUILD_SHARED_LIBS", "OFF")
             .define("LIEF_USE_CRT_RELEASE", "MTd")
-            .define("CMAKE_BUILD_TYPE", "Release")
-            .static_crt(true);
+            .static_crt(true)
+            .build();
         let dst = config.build();
 
         println!(
