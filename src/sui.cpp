@@ -8,8 +8,10 @@
 #include "sui.h"
 
 // __libc_single_threaded not defined in older GLIBC versions
+#if defined(__linux__)
 __attribute__((weak))
 char __libc_single_threaded = 0;
+#endif
 
 enum class InjectResult { kAlreadyExists, kError, kSuccess };
 
