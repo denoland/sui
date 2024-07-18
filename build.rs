@@ -10,11 +10,21 @@ fn main() {
         config
             .define("BUILD_SHARED_LIBS", "OFF")
             .define("CMAKE_BUILD_TYPE", "Release")
-            .static_crt(true);
+            .static_crt(true)
+            .no_build_target(true);
         let dst = config.build();
 
-        println!("cargo:rustc-link-search=native={}/build", dst.display());
-        println!("cargo:rustc-link-search=native={}/lib", dst.display());
+        println!(
+            "cargo:rustc-link-search=native={}",
+            dst.join("build").display()
+        );
+        println!(
+            "cargo:rustc-link-search=native={}",
+            dst.join("lib").display()
+        );
+
+        let lib_path = dst.join("build").join("lib");
+        println!("cargo:rustc-link-search=native={}", lib_path.display());
     }
 
     println!("cargo:rustc-link-lib=static=LIEF");
