@@ -11,7 +11,7 @@ fn main() {
         let mut config = cmake::Config::new(".");
         config
             .define("BUILD_SHARED_LIBS", "OFF")
-            .define("CMAKE_BUILD_TYPE", "Release");
+            .define("CMAKE_BUILD_TYPE", "Release")
             .static_crt(true);
         let dst = config.build();
 
