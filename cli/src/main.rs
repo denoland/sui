@@ -28,7 +28,8 @@ fn main() {
             libsui::inject_into_elf(&exe, &args[2], &data, true, Box::new(writer));
         }
         ExecutableFormat::MachO => {
-            libsui::inject_into_macho(&exe, &args[2], &args[2], &data, true, Box::new(writer));
+            let r = libsui::inject_macho(&exe, &args[2], &args[2], &data);
+            std::fs::write(&args[4], &r.unwrap()).unwrap();
         }
         ExecutableFormat::PE => {
             libsui::inject_into_pe(&exe, &args[2], &data, true, Box::new(writer));
