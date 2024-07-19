@@ -44,13 +44,13 @@ pub fn inject_pe(
                 return Err("icon table is not a table".to_string());
             }
         };
-        if rc_table.get(ResourceEntryName::from_string(name)).is_none() {
+        if rc_table.get(ResourceEntryName::ID(0x80000000)).is_none() {
             rc_table.insert(
-                ResourceEntryName::from_string(name),
+                ResourceEntryName::ID(0x80000000),
                 ResourceEntry::Table(ResourceTable::default()),
             );
         }
-        let inner_table = rc_table.get(ResourceEntryName::from_string(name));
+        let inner_table = rc_table.get(ResourceEntryName::ID(0x80000000));
         let mut inner_table = match inner_table {
             Some(ResourceEntry::Table(t)) => t.clone(),
             Some(_) => {
