@@ -412,3 +412,5 @@ pub fn inject_macho(
 
     Ok(())
 }
+
+// elf
