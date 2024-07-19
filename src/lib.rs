@@ -44,13 +44,23 @@ pub fn inject_pe(
                 return Err("icon table is not a table".to_string());
             }
         };
+        let inner_table = rc_table.get(*rc_table.entries().first().unwrap());
+        let mut inner_table = match inner_table {
+            Some(ResourceEntry::Table(t)) => t.clone(),
+            Some(_) => {
+                return Err(
+                    "inner manifest table is not a table".to_string(),
+                );
+            }
+            None => ResourceTable::default(),
+        };
 
   let mut entry = editpe::ResourceData::default();
   entry.set_data(sectdata.to_vec());
-  entry.set_codepage(editpe::constants::CODE_PAGE_ID_EN_US as _);
+  // entry.set_codepage(editpe::constants::CODE_PAGE_ID_EN_US as _);
 
   let name = editpe::ResourceEntryName::from_string(name);
-   rc_table 
+   inner_table 
       .insert(name, editpe::ResourceEntry::Data(entry));
   image.set_resource_directory(resources).unwrap();
 
