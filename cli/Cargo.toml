@@ -5,6 +5,3 @@ edition = "2021"
 
 [dependencies]
 libsui = { path = "../" }
-
-[target.'cfg(windows)'.build-dependencies]
-winres = "0.1.12"

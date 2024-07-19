@@ -16,5 +16,5 @@ fn main() {
     let data = std::fs::read(&args[3]).unwrap();
 
     // libsui::inject_macho(&exe, &args[2], &args[2], &data, &args[4]);
-    libsui::inject_pe(&exe, &args[2], &data, &args[4]);
+    libsui::inject_pe(&exe, &args[2], &data, &args[4]).unwrap();
 }

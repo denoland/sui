@@ -16,63 +16,62 @@ use std::fs::File;
 
 // pe
 
-use editpe::Image;
 use editpe::constants::RT_RCDATA;
-use editpe::ResourceEntryName;
+use editpe::constants::{CODE_PAGE_ID_EN_US, LANGUAGE_ID_EN_US};
+use editpe::types::{ResourceDirectoryTable, VersionU16};
+use editpe::Image;
 use editpe::ResourceEntry;
+use editpe::ResourceEntryName;
 use editpe::ResourceTable;
 
-pub fn inject_pe(
-    pe: &[u8],
-    name: &str,
-    sectdata: &[u8],
-    outfile: &str,
-) -> Result<(), String> {
-  let mut image = Image::parse(pe).unwrap();
+pub fn inject_pe(pe: &[u8], name: &str, sectdata: &[u8], outfile: &str) -> Result<(), String> {
+    let mut image = Image::parse(pe).unwrap();
 
-  let mut resources = image.resource_directory().cloned().unwrap_or_default();
-  let root = resources.root_mut();
-      if root.get(ResourceEntryName::ID(RT_RCDATA as u32)).is_none() {
-            root.insert(
-                ResourceEntryName::ID(RT_RCDATA as u32),
-                ResourceEntry::Table(ResourceTable::default()),
-            );
+    let mut resources = image.resource_directory().cloned().unwrap_or_default();
+    let root = resources.root_mut();
+    if root.get(ResourceEntryName::ID(RT_RCDATA as u32)).is_none() {
+        root.insert(
+            ResourceEntryName::ID(RT_RCDATA as u32),
+            ResourceEntry::Table(ResourceTable::default()),
+        );
+    }
+    let rc_table = match root
+        .get_mut(ResourceEntryName::ID(RT_RCDATA as u32))
+        .unwrap()
+    {
+        ResourceEntry::Table(table) => table,
+        ResourceEntry::Data(_) => {
+            return Err("icon table is not a table".to_string());
         }
-        let rc_table = match root.get_mut(ResourceEntryName::ID(RT_RCDATA as u32)).unwrap() {
-            ResourceEntry::Table(table) => table,
-            ResourceEntry::Data(_) => {
-                return Err("icon table is not a table".to_string());
-            }
-        };
-        if rc_table.get(ResourceEntryName::ID(0x80000000)).is_none() {
-            rc_table.insert(
-                ResourceEntryName::ID(0x80000000),
-                ResourceEntry::Table(ResourceTable::default()),
-            );
+    };
+    rc_table.insert(
+        editpe::ResourceEntryName::from_string(name),
+        ResourceEntry::Table(ResourceTable::default()),
+    );
+
+    let rc_table = match rc_table
+        .get_mut(editpe::ResourceEntryName::from_string(name))
+        .unwrap()
+    {
+        ResourceEntry::Table(table) => table,
+        ResourceEntry::Data(_) => {
+            return Err("icon table is not a table".to_string());
         }
-        let inner_table = rc_table.get(ResourceEntryName::ID(0x80000000));
-        let mut inner_table = match inner_table {
-            Some(ResourceEntry::Table(t)) => t.clone(),
-            Some(_) => {
-                return Err(
-                    "inner manifest table is not a table".to_string(),
-                );
-            }
-            None => ResourceTable::default(),
-        };
+    };
+    let mut entry = editpe::ResourceData::default();
+    entry.set_data(sectdata.to_vec());
 
-  let mut entry = editpe::ResourceData::default();
-  entry.set_data(sectdata.to_vec());
-  // entry.set_codepage(editpe::constants::CODE_PAGE_ID_EN_US as _);
+    rc_table.insert(
+        ResourceEntryName::ID(LANGUAGE_ID_EN_US as u32),
+        ResourceEntry::Data(entry),
+    );
 
-  let name = editpe::ResourceEntryName::from_string(name);
-   inner_table 
-      .insert(name, editpe::ResourceEntry::Data(entry));
-  image.set_resource_directory(resources).unwrap();
+    image.set_resource_directory(resources).unwrap();
 
-  let target = image.data();
-  std::fs::write(outfile, target).unwrap();
-  Ok(())
+    let target = image.data();
+    std::fs::write(outfile, target).unwrap();
+
+    Ok(())
 }
 
 // mach-o
@@ -348,9 +347,9 @@ pub fn inject_macho(
 
     let fout = unsafe { libc::fopen(outfile.as_ptr() as *const _, "wb".as_ptr() as *const _) };
 
-    use libc::{fwrite};
+    use libc::fwrite;
     let mut finoff = macho.as_ptr() as *const _;
-    // Write header   
+    // Write header
     unsafe {
         fwrite(finoff, 1, std::mem::size_of::<Header64>(), fout);
         finoff = finoff.add(std::mem::size_of::<Header64>());
@@ -360,32 +359,47 @@ pub fn inject_macho(
     for cmd in commands.iter() {
         if *cmd as *const _ == linkedit_cmd as *const _ {
             unsafe {
-                fwrite(&seg as *const _ as *const _, 1, std::mem::size_of::<SegmentCommand64>(), fout);
-                fwrite(&sec as *const _ as *const _, 1, std::mem::size_of::<Section64>(), fout);
+                fwrite(
+                    &seg as *const _ as *const _,
+                    1,
+                    std::mem::size_of::<SegmentCommand64>(),
+                    fout,
+                );
+                fwrite(
+                    &sec as *const _ as *const _,
+                    1,
+                    std::mem::size_of::<Section64>(),
+                    fout,
+                );
             }
         }
-            unsafe {
-                fwrite(*cmd as *const _ as _, 1, (*cmd).cmdsize as usize, fout);
-            }
+        unsafe {
+            fwrite(*cmd as *const _ as _, 1, (*cmd).cmdsize as usize, fout);
+        }
     }
 
     unsafe {
-      finoff = finoff.add(header.sizeofcmds as usize);
+        finoff = finoff.add(header.sizeofcmds as usize);
     }
 
     // Write rest of the data
     unsafe {
-      fwrite(finoff, 1, rest_datasize as usize - seg.cmdsize as usize, fout);
-      finoff = finoff.add(rest_datasize as usize - seg.cmdsize as usize);
+        fwrite(
+            finoff,
+            1,
+            rest_datasize as usize - seg.cmdsize as usize,
+            fout,
+        );
+        finoff = finoff.add(rest_datasize as usize - seg.cmdsize as usize);
     }
 
     // Write custom data
     unsafe {
-    fwrite(sectdata.as_ptr() as *const _, 1, sectdata.len(), fout);
-    if seg.filesize > sectdata.len() as u64 {
-        let padding = vec![0; (seg.filesize - sectdata.len() as u64) as usize];
-        fwrite(padding.as_ptr() as *const _, 1, padding.len(), fout);
-    }
+        fwrite(sectdata.as_ptr() as *const _, 1, sectdata.len(), fout);
+        if seg.filesize > sectdata.len() as u64 {
+            let padding = vec![0; (seg.filesize - sectdata.len() as u64) as usize];
+            fwrite(padding.as_ptr() as *const _, 1, padding.len(), fout);
+        }
     }
 
     // Write __LINKEDIT data
