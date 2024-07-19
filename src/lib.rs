@@ -1,12 +1,3 @@
-mod sui;
-
-pub use sui::inject_into_elf;
-pub use sui::inject_into_macho;
-pub use sui::inject_into_pe;
-
-pub use sui::get_executable_format;
-pub use sui::ExecutableFormat;
-
 #[cfg(target_os = "linux")]
 mod elf;
 #[cfg(target_os = "macos")]
@@ -16,16 +7,43 @@ mod pe;
 
 #[cfg(target_os = "linux")]
 pub use elf::find_section;
-
 #[cfg(target_os = "macos")]
 pub use macho::find_section;
-
 #[cfg(target_os = "windows")]
 pub use pe::find_section;
 
 use std::fs::File;
 
+// pe
+
+use editpe::Image;
+pub fn inject_pe(
+    pe: &[u8],
+    name: &str,
+    sectdata: &[u8],
+    outfile: &str,
+) -> Result<(), String> {
+  let mut image = Image::parse(pe).unwrap();
+
+  let mut resources = image.resource_directory().cloned().unwrap_or_default();
+  let root = resources.root_mut();
+  let mut entry = editpe::ResourceData::default();
+  entry.set_data(sectdata.to_vec());
+
+  let name = editpe::ResourceEntryName::from_string(name);
+  root
+      .insert(name, editpe::ResourceEntry::Data(entry));
+  image.set_resource_directory(resources).unwrap();
+
+  let target = image.data();
+  std::fs::write(outfile, target).unwrap();
+  Ok(())
+}
+
+// mach-o
+
 #[repr(C)]
+#[derive(Debug, Clone)]
 pub struct SegmentCommand64 {
     pub cmd: u32,
     pub cmdsize: u32,
@@ -53,6 +71,7 @@ pub struct Header64 {
 }
 
 #[repr(C)]
+#[derive(Debug, Clone)]
 pub struct Section64 {
     pub sectname: [u8; 16],
     pub segname: [u8; 16],
@@ -88,7 +107,8 @@ pub fn inject_macho(
     name: &str,
     sectname: &str,
     sectdata: &[u8],
-) -> Result<Vec<u8>, String> {
+    outfile: &str,
+) -> Result<(), String> {
     let header = unsafe { &mut *(macho.as_ptr() as *mut Header64) };
 
     let mut linkedit_cmd = None;
@@ -101,20 +121,20 @@ pub fn inject_macho(
         if cmd.cmd == LC_SEGMENT_64 {
             let segname = unsafe { std::ffi::CStr::from_ptr(cmd.segname.as_ptr() as *const i8) };
             if segname.to_bytes() == SEG_LINKEDIT {
-                linkedit_cmd = Some(cmd);
-                break;
+                linkedit_cmd = Some(unsafe { &mut *(cmd as *mut SegmentCommand64) });
             }
         }
 
         segment = unsafe { segment.add(cmd.cmdsize as usize) };
-
         commands.push(cmd);
     }
+    println!("commands: {:?}", commands.len());
 
     let Some(mut linkedit_cmd) = linkedit_cmd else {
         return Err("Failed to find __LINKEDIT segment".to_string());
     };
 
+    println!("linkedit_cmd: {:?}", linkedit_cmd);
     let rest_datasize =
         linkedit_cmd.fileoff - std::mem::size_of::<Header64>() as u64 - header.sizeofcmds as u64;
 
@@ -135,7 +155,7 @@ pub fn inject_macho(
     seg.vmsize = align_vmsize(sectdata.len() as u64);
     seg.fileoff = linkedit_cmd.fileoff;
     seg.filesize = seg.vmsize;
-    seg.maxprot = 7;
+    seg.maxprot = 0x01;
     seg.initprot = seg.maxprot;
     seg.nsects = 1;
 
@@ -279,7 +299,6 @@ pub fn inject_macho(
                 shift_cmd!(dyld_info.weak_bind_off);
                 shift_cmd!(dyld_info.lazy_bind_off);
                 shift_cmd!(dyld_info.export_off);
-                break;
             }
 
             _ => {}
@@ -290,31 +309,58 @@ pub fn inject_macho(
     header.ncmds += 1;
     header.sizeofcmds += seg.cmdsize;
 
-    let mut out = Vec::new();
+    println!("seg: {:?}", seg);
 
-    // Write header
-    out.extend_from_slice(unsafe {
-        std::slice::from_raw_parts(macho.as_ptr(), std::mem::size_of::<Header64>())
-    });
+use std::os::fd::AsRawFd;
+    let fout = unsafe { libc::fopen(outfile.as_ptr() as *const _, "wb".as_ptr() as *const _) };
 
+    use libc::{fwrite};
+    let mut finoff = macho.as_ptr() as *const _;
+    // Write header   
+    unsafe {
+        fwrite(finoff, 1, std::mem::size_of::<Header64>(), fout);
+        finoff = finoff.add(std::mem::size_of::<Header64>());
+    }
+
+    // Write commands
     for cmd in commands.iter() {
-        if *cmd as *const SegmentCommand64 == linkedit_cmd as *const SegmentCommand64 {
-            out.extend_from_slice(unsafe {
-                std::slice::from_raw_parts(&seg as *const SegmentCommand64 as *const u8, seg.cmdsize as usize)
-            });
-            out.extend_from_slice(unsafe {
-                std::slice::from_raw_parts(&sec as *const Section64 as *const u8, std::mem::size_of::<Section64>())
-            });
-        } else {
-            out.extend_from_slice(unsafe {
-                std::slice::from_raw_parts(*cmd as *const _ as *const u8, (*cmd).cmdsize as usize)
-            });
+        if *cmd as *const _ == linkedit_cmd as *const _ {
+            unsafe {
+                fwrite(&seg as *const _ as *const _, 1, std::mem::size_of::<SegmentCommand64>(), fout);
+                fwrite(&sec as *const _ as *const _, 1, std::mem::size_of::<Section64>(), fout);
+            }
         }
-     }
+            unsafe {
+                fwrite(*cmd as *const _ as _, 1, (*cmd).cmdsize as usize, fout);
+            }
+    }
 
-    out.extend_from_slice(&macho[std::mem::size_of::<Header64>() + header.sizeofcmds as usize..linkedit_fileoff as usize]);
-    out.extend_from_slice(sectdata);
-    out.extend_from_slice(&macho[linkedit_fileoff as usize..]);
+    unsafe {
+      finoff = finoff.add(header.sizeofcmds as usize);
+    }
 
-    Ok(out)
+    // Write rest of the data
+    unsafe {
+      fwrite(finoff, 1, rest_datasize as usize - seg.cmdsize as usize, fout);
+      finoff = finoff.add(rest_datasize as usize - seg.cmdsize as usize);
+    }
+
+    // Write custom data
+    unsafe {
+    fwrite(sectdata.as_ptr() as *const _, 1, sectdata.len(), fout);
+    if seg.filesize > sectdata.len() as u64 {
+        let padding = vec![0; (seg.filesize - sectdata.len() as u64) as usize];
+        fwrite(padding.as_ptr() as *const _, 1, padding.len(), fout);
+    }
+    }
+
+    // Write __LINKEDIT data
+    unsafe {
+        fwrite(finoff, 1, linkedit_cmd.filesize as usize, fout);
+        finoff = finoff.add(linkedit_cmd.filesize as usize);
+    }
+
+    println!("Total size: {}", finoff as usize - macho.as_ptr() as usize);
+
+    Ok(())
 }
