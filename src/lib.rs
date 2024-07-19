@@ -44,7 +44,13 @@ pub fn inject_pe(
                 return Err("icon table is not a table".to_string());
             }
         };
-        let inner_table = rc_table.get(*rc_table.entries().first().unwrap());
+        if rc_table.get(ResourceEntryName::from_string(name)).is_none() {
+            rc_table.insert(
+                ResourceEntryName::from_string(name),
+                ResourceEntry::Table(ResourceTable::default()),
+            );
+        }
+        let inner_table = rc_table.get(ResourceEntryName::from_string(name));
         let mut inner_table = match inner_table {
             Some(ResourceEntry::Table(t)) => t.clone(),
             Some(_) => {
