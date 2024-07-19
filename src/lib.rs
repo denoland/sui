@@ -311,7 +311,6 @@ pub fn inject_macho(
 
     println!("seg: {:?}", seg);
 
-use std::os::fd::AsRawFd;
     let fout = unsafe { libc::fopen(outfile.as_ptr() as *const _, "wb".as_ptr() as *const _) };
 
     use libc::{fwrite};
