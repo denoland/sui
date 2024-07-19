@@ -17,6 +17,11 @@ use std::fs::File;
 // pe
 
 use editpe::Image;
+use editpe::constants::RT_RCDATA;
+use editpe::ResourceEntryName;
+use editpe::ResourceEntry;
+use editpe::ResourceTable;
+
 pub fn inject_pe(
     pe: &[u8],
     name: &str,
@@ -27,12 +32,25 @@ pub fn inject_pe(
 
   let mut resources = image.resource_directory().cloned().unwrap_or_default();
   let root = resources.root_mut();
+      if root.get(ResourceEntryName::ID(RT_RCDATA as u32)).is_none() {
+            root.insert(
+                ResourceEntryName::ID(RT_RCDATA as u32),
+                ResourceEntry::Table(ResourceTable::default()),
+            );
+        }
+        let rc_table = match root.get_mut(ResourceEntryName::ID(RT_RCDATA as u32)).unwrap() {
+            ResourceEntry::Table(table) => table,
+            ResourceEntry::Data(_) => {
+                return Err("icon table is not a table".to_string());
+            }
+        };
+
   let mut entry = editpe::ResourceData::default();
   entry.set_data(sectdata.to_vec());
   entry.set_codepage(editpe::constants::CODE_PAGE_ID_EN_US as _);
 
   let name = editpe::ResourceEntryName::from_string(name);
-  root
+   rc_table 
       .insert(name, editpe::ResourceEntry::Data(entry));
   image.set_resource_directory(resources).unwrap();
 
