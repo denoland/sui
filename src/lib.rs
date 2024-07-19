@@ -29,6 +29,7 @@ pub fn inject_pe(
   let root = resources.root_mut();
   let mut entry = editpe::ResourceData::default();
   entry.set_data(sectdata.to_vec());
+  entry.set_codepage(editpe::constants::CODE_PAGE_ID_EN_US as _);
 
   let name = editpe::ResourceEntryName::from_string(name);
   root
