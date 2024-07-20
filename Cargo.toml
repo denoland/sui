@@ -10,6 +10,7 @@ repository = "https://github.com/littledivy/sui"
 [dependencies]
 libc = "0.2"
 editpe = "0.1.0"
+# object = { version = "0.36.1", features = ["build"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.48.0", features = ["Win32_System", "Win32_System_LibraryLoader", "Win32_Foundation"] }

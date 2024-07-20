@@ -414,3 +414,56 @@ pub fn inject_macho(
 }
 
 // elf
+pub fn inject_elf(
+  elf: &[u8],
+  name: &str,
+  sectdata: &[u8],
+  outfile: &str,
+) -> Result<(), String> {
+  let mut elf = elf.to_vec();
+  elf.extend_from_slice(sectdata);
+  const MAGIC: u32 = 0x501e;
+
+  elf.extend_from_slice(&MAGIC.to_le_bytes());
+  elf.extend_from_slice(&(sectdata.len() as u32 + 8).to_le_bytes());
+
+  std::fs::write(outfile, elf).unwrap();
+
+  Ok(())
+}
+
+use object::build::elf as e;
+
+pub fn inject_elf_2(
+    elf: &[u8],
+    name: &str,
+    sectdata: &[u8],
+    outfile: &str,
+) -> Result<(), String> {
+    let mut builder = e::Builder::read(elf).unwrap();
+    
+    let section = builder.sections.add();
+    section.sh_type = object::elf::SHT_NOTE;
+    section.sh_flags = object::elf::SHF_ALLOC as u64;
+    section.sh_offset = 0;
+    section.sh_size = sectdata.len() as u64;
+    section.name = "__SUI".into();
+    section.data = e::SectionData::Note(sectdata.into());
+    let id = section.id();
+
+    builder.set_section_sizes();
+
+    let segment = builder.segments.add();
+    segment.p_type = object::elf::PT_NOTE;
+    segment.p_flags = object::elf::PF_R;
+    segment.p_align = 4;
+    segment.p_filesz = sectdata.len() as u64;
+    segment.p_memsz = sectdata.len() as u64;
+    segment.append_section(builder.sections.get_mut(id));
+
+    let mut out = Vec::new();
+    builder.write(&mut out).unwrap();
+    std::fs::write(outfile, out).unwrap();
+
+    Ok(())
+}

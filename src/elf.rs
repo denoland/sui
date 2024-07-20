@@ -24,7 +24,7 @@ struct Elf64_Nhdr {
     pub n_type: u32,
 }
 
-pub fn find_section(elf_section_name: &str) -> Option<&[u8]> {
+pub fn find_section2(elf_section_name: &str) -> Option<&[u8]> {
     unsafe {
         let mut main_program_info: dl_phdr_info = std::mem::zeroed();
         dl_iterate_phdr(
@@ -79,3 +79,32 @@ pub fn find_section(elf_section_name: &str) -> Option<&[u8]> {
         None
     }
 }
+use std::io::SeekFrom;
+use std::io::Read;
+use std::io::Seek;
+pub fn find_section(elf_section_name: &str) -> Option<Vec<u8>> {
+  let exe = std::env::current_exe().unwrap();
+  
+  // Check magic and offset
+  let mut file = std::fs::File::open(exe).unwrap();
+  file.seek(SeekFrom::End(-8)).unwrap();
+  let mut buf = [0; 8];
+  file.read_exact(&mut buf).unwrap();
+  let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+  if magic != 0x501e {
+    return None;
+  }
+
+  let offset = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+
+  file.seek(SeekFrom::End(-(offset as i64))).unwrap();
+
+  // Read section data
+  let mut buf = Vec::new();
+  file.read_to_end(&mut buf).unwrap();
+
+  buf = buf[..buf.len() - 9].to_vec();
+
+  return Some(buf);
+}
+
