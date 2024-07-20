@@ -1,9 +1,26 @@
-#[cfg(target_os = "linux")]
-mod elf;
-#[cfg(target_os = "macos")]
-mod macho;
-#[cfg(target_os = "windows")]
-mod pe;
+/*
+ * "Sui: embed and extract auxillary data from binaries"
+ *
+ * Copyright (c) 2024 Divy Srivastaa
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
 
 #[cfg(target_os = "linux")]
 pub use elf::find_section;
@@ -12,13 +29,10 @@ pub use macho::find_section;
 #[cfg(target_os = "windows")]
 pub use pe::find_section;
 
-use std::fs::File;
-
 // pe
 
+use editpe::constants::LANGUAGE_ID_EN_US;
 use editpe::constants::RT_RCDATA;
-use editpe::constants::{CODE_PAGE_ID_EN_US, LANGUAGE_ID_EN_US};
-use editpe::types::{ResourceDirectoryTable, VersionU16};
 use editpe::Image;
 use editpe::ResourceEntry;
 use editpe::ResourceEntryName;
@@ -74,7 +88,91 @@ pub fn inject_pe(pe: &[u8], name: &str, sectdata: &[u8], outfile: &str) -> Resul
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
+mod pe {
+    use std::ffi::CString;
+
+    use windows_sys::Win32::System::LibraryLoader::FindResourceA;
+    use windows_sys::Win32::System::LibraryLoader::LoadResource;
+    use windows_sys::Win32::System::LibraryLoader::LockResource;
+    use windows_sys::Win32::System::LibraryLoader::SizeofResource;
+
+    pub fn find_section(section_name: &str) -> Option<&[u8]> {
+        let Ok(section_name) = CString::new(section_name.to_uppercase()) else {
+            return None;
+        };
+
+        unsafe {
+            let resource_handle = FindResourceA(0, section_name.as_ptr() as _, 10 as *const _);
+            if resource_handle == 0 {
+                return None;
+            }
+
+            let resource_data = LoadResource(0, resource_handle);
+            if resource_data == 0 {
+                return None;
+            }
+
+            let resource_size = SizeofResource(0, resource_handle);
+            if resource_size == 0 {
+                return None;
+            }
+
+            let resource_ptr = LockResource(resource_data);
+            Some(std::slice::from_raw_parts(
+                resource_ptr as *const u8,
+                resource_size as usize,
+            ))
+        }
+    }
+}
+
 // mach-o
+
+#[cfg(target_os = "macos")]
+mod macho {
+    use std::ffi::CString;
+    use std::os::raw::c_char;
+
+    extern "C" {
+        pub fn getsectdata(
+            segname: *const c_char,
+            sectname: *const c_char,
+            size: *mut usize,
+        ) -> *mut c_char;
+
+        pub fn _dyld_get_image_vmaddr_slide(image_index: usize) -> usize;
+    }
+
+    pub fn find_section(section_name: &str) -> Option<&[u8]> {
+        let mut section_size: usize = 0;
+        let segment_name = "__SUI\0";
+        let section_name = if section_name.starts_with("__") {
+            section_name.to_string()
+        } else {
+            format!("__{}", section_name)
+        };
+        let section_name = CString::new(section_name).unwrap();
+
+        unsafe {
+            let mut ptr = getsectdata(
+                segment_name.as_ptr() as *const c_char,
+                section_name.as_ptr() as *const c_char,
+                &mut section_size as *mut usize,
+            );
+
+            if ptr.is_null() {
+                return None;
+            }
+
+            // Add the "virtual memory address slide" amount to ensure a valid pointer
+            // in cases where the virtual memory address have been adjusted by the OS.
+            ptr = ptr.wrapping_add(_dyld_get_image_vmaddr_slide(0));
+
+            Some(std::slice::from_raw_parts(ptr as *const u8, section_size))
+        }
+    }
+}
 
 #[repr(C)]
 #[derive(Debug, Clone)]
@@ -164,7 +262,7 @@ pub fn inject_macho(
     }
     println!("commands: {:?}", commands.len());
 
-    let Some(mut linkedit_cmd) = linkedit_cmd else {
+    let Some(linkedit_cmd) = linkedit_cmd else {
         return Err("Failed to find __LINKEDIT segment".to_string());
     };
 
@@ -339,7 +437,6 @@ pub fn inject_macho(
         }
     }
 
-    let old_ncmds = header.ncmds;
     header.ncmds += 1;
     header.sizeofcmds += seg.cmdsize;
 
@@ -414,56 +511,48 @@ pub fn inject_macho(
 }
 
 // elf
-pub fn inject_elf(
-  elf: &[u8],
-  name: &str,
-  sectdata: &[u8],
-  outfile: &str,
-) -> Result<(), String> {
-  let mut elf = elf.to_vec();
-  elf.extend_from_slice(sectdata);
-  const MAGIC: u32 = 0x501e;
+pub fn inject_elf(elf: &[u8], _name: &str, sectdata: &[u8], outfile: &str) -> Result<(), String> {
+    let mut elf = elf.to_vec();
+    elf.extend_from_slice(sectdata);
+    const MAGIC: u32 = 0x501e;
 
-  elf.extend_from_slice(&MAGIC.to_le_bytes());
-  elf.extend_from_slice(&(sectdata.len() as u32 + 8).to_le_bytes());
+    elf.extend_from_slice(&MAGIC.to_le_bytes());
+    elf.extend_from_slice(&(sectdata.len() as u32 + 8).to_le_bytes());
 
-  std::fs::write(outfile, elf).unwrap();
-
-  Ok(())
-}
-
-use object::build::elf as e;
-
-pub fn inject_elf_2(
-    elf: &[u8],
-    name: &str,
-    sectdata: &[u8],
-    outfile: &str,
-) -> Result<(), String> {
-    let mut builder = e::Builder::read(elf).unwrap();
-    
-    let section = builder.sections.add();
-    section.sh_type = object::elf::SHT_NOTE;
-    section.sh_flags = object::elf::SHF_ALLOC as u64;
-    section.sh_offset = 0;
-    section.sh_size = sectdata.len() as u64;
-    section.name = "__SUI".into();
-    section.data = e::SectionData::Note(sectdata.into());
-    let id = section.id();
-
-    builder.set_section_sizes();
-
-    let segment = builder.segments.add();
-    segment.p_type = object::elf::PT_NOTE;
-    segment.p_flags = object::elf::PF_R;
-    segment.p_align = 4;
-    segment.p_filesz = sectdata.len() as u64;
-    segment.p_memsz = sectdata.len() as u64;
-    segment.append_section(builder.sections.get_mut(id));
-
-    let mut out = Vec::new();
-    builder.write(&mut out).unwrap();
-    std::fs::write(outfile, out).unwrap();
+    std::fs::write(outfile, elf).unwrap();
 
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+mod elf {
+    use std::io::Read;
+    use std::io::Seek;
+    use std::io::SeekFrom;
+
+    pub fn find_section(_: &str) -> Option<Vec<u8>> {
+        let exe = std::env::current_exe().unwrap();
+
+        // Check magic and offset
+        let mut file = std::fs::File::open(exe).unwrap();
+        file.seek(SeekFrom::End(-8)).unwrap();
+        let mut buf = [0; 8];
+        file.read_exact(&mut buf).unwrap();
+        let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        if magic != 0x501e {
+            return None;
+        }
+
+        let offset = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+
+        file.seek(SeekFrom::End(-(offset as i64))).unwrap();
+
+        // Read section data
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf).unwrap();
+
+        buf = buf[..buf.len() - 9].to_vec();
+
+        return Some(buf);
+    }
 }

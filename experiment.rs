@@ -1,3 +1,27 @@
+/*
+ * "Sui experiments that may make into the main library"
+ *
+ * Copyright (c) 2024 Divy Srivastaa
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+
 use libc::{dl_iterate_phdr, dl_phdr_info, strncmp, Elf64_Phdr, PT_NOTE};
 use std::mem::size_of;
 use std::os::raw::{c_char, c_int, c_void};
@@ -79,32 +103,40 @@ pub fn find_section2(elf_section_name: &str) -> Option<&[u8]> {
         None
     }
 }
-use std::io::SeekFrom;
-use std::io::Read;
-use std::io::Seek;
-pub fn find_section(elf_section_name: &str) -> Option<Vec<u8>> {
-  let exe = std::env::current_exe().unwrap();
-  
-  // Check magic and offset
-  let mut file = std::fs::File::open(exe).unwrap();
-  file.seek(SeekFrom::End(-8)).unwrap();
-  let mut buf = [0; 8];
-  file.read_exact(&mut buf).unwrap();
-  let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-  if magic != 0x501e {
-    return None;
-  }
 
-  let offset = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+pub fn inject_elf(
+    elf: &[u8],
+    name: &str,
+    sectdata: &[u8],
+    outfile: &str,
+) -> Result<(), String> {
+    use object::build::elf as e;
+    
+    let mut builder = e::Builder::read(elf).unwrap();
+    
+    let section = builder.sections.add();
+    section.sh_type = object::elf::SHT_NOTE;
+    section.sh_flags = object::elf::SHF_ALLOC as u64;
+    section.sh_offset = 0;
+    section.sh_size = sectdata.len() as u64;
+    section.name = "__SUI".into();
+    section.data = e::SectionData::Note(sectdata.into());
+    let id = section.id();
 
-  file.seek(SeekFrom::End(-(offset as i64))).unwrap();
+    builder.set_section_sizes();
 
-  // Read section data
-  let mut buf = Vec::new();
-  file.read_to_end(&mut buf).unwrap();
+    let segment = builder.segments.add();
+    segment.p_type = object::elf::PT_NOTE;
+    segment.p_flags = object::elf::PF_R;
+    segment.p_align = 4;
+    segment.p_filesz = sectdata.len() as u64;
+    segment.p_memsz = sectdata.len() as u64;
+    segment.append_section(builder.sections.get_mut(id));
 
-  buf = buf[..buf.len() - 9].to_vec();
+    let mut out = Vec::new();
+    builder.write(&mut out).unwrap();
+    std::fs::write(outfile, out).unwrap();
 
-  return Some(buf);
+    Ok(())
 }
 
