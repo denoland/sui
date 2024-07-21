@@ -1,0 +1,24 @@
+[package]
+name = "sui-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.libsui]
+path = ".."
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "macho_inject"
+path = "fuzz_targets/macho_inject.rs"
+test = false
+doc = false
+
