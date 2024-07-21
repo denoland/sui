@@ -262,7 +262,7 @@ pub struct Macho {
     sectdata: Option<Vec<u8>>,
 }
 
-const SEGNAME: [u8; 16] = *b"__SUI\0\0\0\0\0\0\0\0\0\0\0";
+pub(crate) const SEGNAME: [u8; 16] = *b"__SUI\0\0\0\0\0\0\0\0\0\0\0";
 
 impl Macho {
     pub fn from(obj: Vec<u8>) -> Result<Self, Error> {
@@ -510,6 +510,7 @@ impl Macho {
 
 #[cfg(target_os = "macos")]
 mod macho {
+    use super::SEGNAME;
     use std::ffi::CString;
     use std::os::raw::c_char;
 
