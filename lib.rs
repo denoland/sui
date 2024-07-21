@@ -22,10 +22,13 @@
  * THE SOFTWARE.
  */
 
+use core::mem::size_of;
 use editpe::{
     constants::{LANGUAGE_ID_EN_US, RT_RCDATA},
     ResourceEntry, ResourceEntryName, ResourceTable,
 };
+use std::io::Write;
+use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 #[cfg(target_os = "linux")]
 pub use elf::find_section;
@@ -168,53 +171,6 @@ mod pe {
     }
 }
 
-// mach-o
-#[cfg(target_os = "macos")]
-mod macho {
-    use std::ffi::CString;
-    use std::os::raw::c_char;
-
-    extern "C" {
-        pub fn getsectdata(
-            segname: *const c_char,
-            sectname: *const c_char,
-            size: *mut usize,
-        ) -> *mut c_char;
-
-        pub fn _dyld_get_image_vmaddr_slide(image_index: usize) -> usize;
-    }
-
-    pub fn find_section(section_name: &str) -> Option<&[u8]> {
-        let mut section_size: usize = 0;
-        let segment_name = "__SUI\0";
-        let section_name = if section_name.starts_with("__") {
-            section_name.to_string()
-        } else {
-            format!("__{}", section_name)
-        };
-        let section_name = CString::new(section_name).unwrap();
-
-        unsafe {
-            let mut ptr = getsectdata(
-                segment_name.as_ptr() as *const c_char,
-                section_name.as_ptr() as *const c_char,
-                &mut section_size as *mut usize,
-            );
-
-            if ptr.is_null() {
-                return None;
-            }
-
-            // Add the "virtual memory address slide" amount to ensure a valid pointer
-            // in cases where the virtual memory address have been adjusted by the OS.
-            ptr = ptr.wrapping_add(_dyld_get_image_vmaddr_slide(0));
-            Some(std::slice::from_raw_parts(ptr as *const u8, section_size))
-        }
-    }
-}
-
-use zerocopy::{AsBytes, FromBytes, FromZeroes};
-
 #[repr(C)]
 #[derive(Debug, Clone, FromBytes, FromZeroes, AsBytes)]
 pub struct SegmentCommand64 {
@@ -306,22 +262,32 @@ pub struct Macho {
     sectdata: Option<Vec<u8>>,
 }
 
-use std::io::Write;
+const SEGNAME: [u8; 16] = *b"__SUI\0\0\0\0\0\0\0\0\0\0\0";
 
 impl Macho {
-    pub fn from(obj: Vec<u8>) -> Self {
-        let header = Header64::read_from_prefix(&obj).unwrap();
-        let mut commands: Vec<(u32, u32, usize)> = Vec::new();
+    pub fn from(obj: Vec<u8>) -> Result<Self, Error> {
+        let header = Header64::read_from_prefix(&obj)
+            .ok_or(Error::InvalidObject("Failed to read header"))?;
+        let mut commands: Vec<(u32, u32, usize)> = Vec::with_capacity(header.ncmds as usize);
 
-        let mut offset = std::mem::size_of::<Header64>() as usize;
+        let mut offset = size_of::<Header64>();
         let mut linkedit_cmd = None;
 
         for _ in 0..header.ncmds as usize {
-            let cmd = u32::from_le_bytes(obj[offset..offset + 4].try_into().unwrap());
-            let cmdsize = u32::from_le_bytes(obj[offset + 4..offset + 8].try_into().unwrap());
+            let cmd = u32::from_le_bytes(
+                obj[offset..offset + 4]
+                    .try_into()
+                    .map_err(|_| Error::InvalidObject("Failed to read command"))?,
+            );
+            let cmdsize = u32::from_le_bytes(
+                obj[offset + 4..offset + 8]
+                    .try_into()
+                    .map_err(|_| Error::InvalidObject("Failed to read command size"))?,
+            );
 
             if cmd == LC_SEGMENT_64 {
-                let segcmd = SegmentCommand64::read_from_prefix(&obj[offset..]).unwrap();
+                let segcmd = SegmentCommand64::read_from_prefix(&obj[offset..])
+                    .ok_or(Error::InvalidObject("Failed to read segment command"))?;
                 if segcmd.segname[..SEG_LINKEDIT.len()] == *SEG_LINKEDIT {
                     linkedit_cmd = Some(segcmd);
                 }
@@ -332,12 +298,11 @@ impl Macho {
         }
 
         let Some(linkedit_cmd) = linkedit_cmd else {
-            panic!("Failed to find __LINKEDIT segment");
+            return Err(Error::InvalidObject("Linkedit segment not found"));
         };
-        let rest_size = linkedit_cmd.fileoff
-            - std::mem::size_of::<Header64>() as u64
-            - header.sizeofcmds as u64;
-        Self {
+        let rest_size =
+            linkedit_cmd.fileoff - size_of::<Header64>() as u64 - header.sizeofcmds as u64;
+        Ok(Self {
             header,
             commands,
             linkedit_cmd,
@@ -346,39 +311,36 @@ impl Macho {
             seg: SegmentCommand64::new_zeroed(),
             sec: Section64::new_zeroed(),
             sectdata: None,
-        }
+        })
     }
 
     pub fn write_section(mut self, name: &str, sectdata: Vec<u8>) -> Result<Self, Error> {
-        self.seg.cmd = LC_SEGMENT_64;
-        self.seg.cmdsize = std::mem::size_of::<SegmentCommand64>() as u32
-            + std::mem::size_of::<Section64>() as u32;
-
-        // Copy segment name
-        let segname = name.as_bytes();
-        for i in 0..segname.len() {
-            self.seg.segname[i] = segname[i] as u8;
-        }
-
-        self.seg.vmaddr = self.linkedit_cmd.vmaddr;
-        self.seg.vmsize = align_vmsize(sectdata.len() as u64);
-        self.seg.fileoff = self.linkedit_cmd.fileoff;
-        self.seg.filesize = self.seg.vmsize;
-        self.seg.maxprot = 0x01;
-        self.seg.initprot = self.seg.maxprot;
-        self.seg.nsects = 1;
+        self.seg = SegmentCommand64 {
+            cmd: LC_SEGMENT_64,
+            cmdsize: size_of::<SegmentCommand64>() as u32 + size_of::<Section64>() as u32,
+            segname: SEGNAME,
+            vmaddr: self.linkedit_cmd.vmaddr,
+            vmsize: align_vmsize(sectdata.len() as u64),
+            filesize: align_vmsize(sectdata.len() as u64),
+            fileoff: self.linkedit_cmd.fileoff,
+            maxprot: 0x01,
+            initprot: 0x01,
+            nsects: 1,
+            flags: 0,
+        };
 
         // Copy section name
         let sectname = name.as_bytes();
-        for i in 0..sectname.len() {
-            self.sec.sectname[i] = sectname[i] as u8;
-        }
-        self.sec.segname = *b"__SUI\0\0\0\0\0\0\0\0\0\0\0";
 
-        self.sec.addr = self.seg.vmaddr;
-        self.sec.size = sectdata.len() as u64;
-        self.sec.offset = self.seg.fileoff as u32;
-        self.sec.align = if self.sec.size < 16 { 0 } else { 4 };
+        self.sec = Section64 {
+            addr: self.seg.vmaddr,
+            size: sectdata.len() as u64,
+            offset: self.linkedit_cmd.fileoff as u32,
+            align: if sectdata.len() < 16 { 0 } else { 4 },
+            segname: SEGNAME,
+            sectname: sectname.try_into().map_err(|_| Error::InternalError)?,
+            ..self.sec
+        };
 
         self.linkedit_cmd.vmaddr += self.seg.vmsize;
         let linkedit_fileoff = self.linkedit_cmd.fileoff;
@@ -408,7 +370,8 @@ impl Macho {
                         pub strsize: u32,
                     }
 
-                    let cmd = SymtabCommand::mut_from_prefix(&mut self.data[*offset..]).unwrap();
+                    let cmd = SymtabCommand::mut_from_prefix(&mut self.data[*offset..])
+                        .ok_or(Error::InvalidObject("Failed to read symtab command"))?;
                     shift_cmd!(cmd.symoff);
                     shift_cmd!(cmd.stroff);
                 }
@@ -438,7 +401,8 @@ impl Macho {
                         pub nlocrel: u32,
                     }
 
-                    let cmd = DysymtabCommand::mut_from_prefix(&mut self.data[*offset..]).unwrap();
+                    let cmd = DysymtabCommand::mut_from_prefix(&mut self.data[*offset..])
+                        .ok_or(Error::InvalidObject("Failed to read dysymtab command"))?;
                     shift_cmd!(cmd.tocoff);
                     shift_cmd!(cmd.modtaboff);
                     shift_cmd!(cmd.extrefsymoff);
@@ -462,8 +426,8 @@ impl Macho {
                         dataoff: u32,
                         datasize: u32,
                     }
-                    let cmd =
-                        LinkeditDataCommand::mut_from_prefix(&mut self.data[*offset..]).unwrap();
+                    let cmd = LinkeditDataCommand::mut_from_prefix(&mut self.data[*offset..])
+                        .ok_or(Error::InvalidObject("Failed to read linkedit data command"))?;
                     shift_cmd!(cmd.dataoff);
                 }
 
@@ -484,8 +448,8 @@ impl Macho {
                         pub export_off: u32,
                         pub export_size: u32,
                     }
-                    let dyld_info =
-                        DyldInfoCommand::mut_from_prefix(&mut self.data[*offset..]).unwrap();
+                    let dyld_info = DyldInfoCommand::mut_from_prefix(&mut self.data[*offset..])
+                        .ok_or(Error::InvalidObject("Failed to read dyld info command"))?;
                     shift_cmd!(dyld_info.rebase_off);
                     shift_cmd!(dyld_info.bind_off);
                     shift_cmd!(dyld_info.weak_bind_off);
@@ -510,7 +474,8 @@ impl Macho {
 
         for (cmd, cmdsize, offset) in self.commands.iter_mut() {
             if *cmd == LC_SEGMENT_64 {
-                let segcmd = SegmentCommand64::read_from_prefix(&self.data[*offset..]).unwrap();
+                let segcmd = SegmentCommand64::read_from_prefix(&self.data[*offset..])
+                    .ok_or(Error::InvalidObject("Failed to read segment command"))?;
                 if segcmd.segname[..SEG_LINKEDIT.len()] == *SEG_LINKEDIT {
                     writer.write_all(self.seg.as_bytes())?;
                     writer.write_all(self.sec.as_bytes())?;
@@ -522,7 +487,7 @@ impl Macho {
             writer.write_all(&self.data[*offset..*offset + *cmdsize as usize])?;
         }
 
-        let mut off = self.header.sizeofcmds as usize + std::mem::size_of::<Header64>();
+        let mut off = self.header.sizeofcmds as usize + size_of::<Header64>();
 
         let len = self.rest_size as usize - self.seg.cmdsize as usize;
         writer.write_all(&self.data[off..off + len])?;
@@ -540,6 +505,44 @@ impl Macho {
         writer.write_all(&self.data[off..off + self.linkedit_cmd.filesize as usize])?;
 
         Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod macho {
+    use std::ffi::CString;
+    use std::os::raw::c_char;
+
+    extern "C" {
+        pub fn getsectdata(
+            segname: *const c_char,
+            sectname: *const c_char,
+            size: *mut usize,
+        ) -> *mut c_char;
+
+        pub fn _dyld_get_image_vmaddr_slide(image_index: usize) -> usize;
+    }
+
+    pub fn find_section(section_name: &str) -> Option<&[u8]> {
+        let mut section_size: usize = 0;
+        let section_name = CString::new(section_name).ok()?;
+
+        unsafe {
+            let mut ptr = getsectdata(
+                SEGNAME.as_ptr() as *const c_char,
+                section_name.as_ptr() as *const c_char,
+                &mut section_size as *mut usize,
+            );
+
+            if ptr.is_null() {
+                return None;
+            }
+
+            // Add the "virtual memory address slide" amount to ensure a valid pointer
+            // in cases where the virtual memory address have been adjusted by the OS.
+            ptr = ptr.wrapping_add(_dyld_get_image_vmaddr_slide(0));
+            Some(std::slice::from_raw_parts(ptr as *const u8, section_size))
+        }
     }
 }
 
@@ -574,7 +577,6 @@ mod elf {
     pub fn find_section(_: &str) -> Option<Vec<u8>> {
         let exe = std::env::current_exe().unwrap();
 
-        // Check magic and offset
         let mut file = std::fs::File::open(exe).unwrap();
         file.seek(SeekFrom::End(-8)).unwrap();
         let mut buf = [0; 8];
@@ -594,21 +596,25 @@ mod elf {
 
         buf = buf[..buf.len() - 8].to_vec();
 
-        return Some(buf);
+        Some(buf)
     }
 }
 
+/// Utilities for detecting binary formats
 pub mod utils {
+    /// Check if the given data is an ELF64 binary
     pub fn is_elf(data: &[u8]) -> bool {
         let magic = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
         magic == 0x7f454c46
     }
 
+    /// Check if the given data is a 64-bit Mach-O binary
     pub fn is_macho(data: &[u8]) -> bool {
         let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         magic == 0xfeedfacf
     }
 
+    /// Check if the given data is a PE32+ binary
     pub fn is_pe(data: &[u8]) -> bool {
         let magic = u16::from_le_bytes([data[0], data[1]]);
         magic == 0x5a4d

@@ -30,7 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .write_resource("_SUI", data)?
             .build(&mut out)?;
     } else if utils::is_macho(&exe) {
-        Macho::from(exe)
+        Macho::from(exe)?
             .write_section("__SUI", data)?
             .build(&mut out)?;
     } else if utils::is_elf(&exe) {
