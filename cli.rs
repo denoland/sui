@@ -1,15 +1,21 @@
 use libsui::find_section;
+use libsui::Elf;
 use libsui::Macho;
 use libsui::PortableExecutable;
+
+use libsui::utils;
 
 const HELP: &str = r#"Usage: sui <exe> <data_file> <output>"#;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(section) = find_section("__SUI") {
+        println!("Found section");
+        println!("{}", std::str::from_utf8(&section)?);
+        return Ok(());
+    }
+
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 5 {
-        if let Some(section) = find_section("__SUI") {
-            println!("Found section: {:?}", std::str::from_utf8(&section));
-        }
         eprintln!("{}", HELP);
         std::process::exit(1);
     }
@@ -18,18 +24,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data = std::fs::read(&args[3])?;
 
     let mut out = std::fs::File::create(&args[4])?;
-    // libsui::inject_macho(&exe, &args[2], &args[2], &data, &args[4]);
-    // libsui::inject_pe(&exe, &args[2], &data, &args[4]).unwrap();
 
-    // PortableExecutable::from(&exe)?
-    //    .write_resource("_SUI", data)?
-    //    .build(&mut out)?;
+    if utils::is_pe(&exe) {
+        PortableExecutable::from(&exe)?
+            .write_resource("_SUI", data)?
+            .build(&mut out)?;
+    } else if utils::is_macho(&exe) {
+        Macho::from(exe)
+            .write_section("__SUI", data)?
+            .build(&mut out)?;
+    } else if utils::is_elf(&exe) {
+        Elf::new(&exe).append(&data, &mut out)?;
+    } else {
+        eprintln!("Unsupported file format");
+        std::process::exit(1);
+    }
 
-    Macho::from(exe)
-        .write_section("__SUI", data)?
-        .build(&mut out)?;
-
-    //    Elf::new(&exe)
-    //        .append(&data);
     Ok(())
 }

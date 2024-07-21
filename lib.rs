@@ -208,7 +208,6 @@ mod macho {
             // Add the "virtual memory address slide" amount to ensure a valid pointer
             // in cases where the virtual memory address have been adjusted by the OS.
             ptr = ptr.wrapping_add(_dyld_get_image_vmaddr_slide(0));
-
             Some(std::slice::from_raw_parts(ptr as *const u8, section_size))
         }
     }
@@ -307,6 +306,8 @@ pub struct Macho {
     sectdata: Option<Vec<u8>>,
 }
 
+use std::io::Write;
+
 impl Macho {
     pub fn from(obj: Vec<u8>) -> Self {
         let header = Header64::read_from_prefix(&obj).unwrap();
@@ -321,7 +322,7 @@ impl Macho {
 
             if cmd == LC_SEGMENT_64 {
                 let segcmd = SegmentCommand64::read_from_prefix(&obj[offset..]).unwrap();
-                if segcmd.segname == SEG_LINKEDIT {
+                if segcmd.segname[..SEG_LINKEDIT.len()] == *SEG_LINKEDIT {
                     linkedit_cmd = Some(segcmd);
                 }
             }
@@ -333,7 +334,9 @@ impl Macho {
         let Some(linkedit_cmd) = linkedit_cmd else {
             panic!("Failed to find __LINKEDIT segment");
         };
-        let rest_size = linkedit_cmd.fileoff - offset as u64 - header.sizeofcmds as u64;
+        let rest_size = linkedit_cmd.fileoff
+            - std::mem::size_of::<Header64>() as u64
+            - header.sizeofcmds as u64;
         Self {
             header,
             commands,
@@ -375,7 +378,7 @@ impl Macho {
         self.sec.addr = self.seg.vmaddr;
         self.sec.size = sectdata.len() as u64;
         self.sec.offset = self.seg.fileoff as u32;
-        self.sec.align = if self.sec.size < 15 { 0 } else { 4 };
+        self.sec.align = if self.sec.size < 16 { 0 } else { 4 };
 
         self.linkedit_cmd.vmaddr += self.seg.vmsize;
         let linkedit_fileoff = self.linkedit_cmd.fileoff;
@@ -502,335 +505,64 @@ impl Macho {
     }
 
     /// Build and write the modified Mach-O file
-    pub fn build<W: std::io::Write + std::io::Seek>(mut self, writer: &mut W) -> Result<(), Error> {
-        writer.write(self.header.as_bytes())?;
+    pub fn build<W: Write>(mut self, writer: &mut W) -> Result<(), Error> {
+        writer.write_all(self.header.as_bytes())?;
 
-        let mut off = std::mem::size_of::<Header64>();
         for (cmd, cmdsize, offset) in self.commands.iter_mut() {
             if *cmd == LC_SEGMENT_64 {
                 let segcmd = SegmentCommand64::read_from_prefix(&self.data[*offset..]).unwrap();
-                if segcmd.segname == SEG_LINKEDIT {
-                    writer.write(self.seg.as_bytes())?;
-                    writer.write(self.sec.as_bytes())?;
+                if segcmd.segname[..SEG_LINKEDIT.len()] == *SEG_LINKEDIT {
+                    writer.write_all(self.seg.as_bytes())?;
+                    writer.write_all(self.sec.as_bytes())?;
+
+                    writer.write_all(self.linkedit_cmd.as_bytes())?;
+                    continue;
                 }
             }
             writer.write_all(&self.data[*offset..*offset + *cmdsize as usize])?;
-            off += *cmdsize as usize;
         }
 
-        // Write rest of the data
-        let len = self.rest_size as usize - self.seg.cmdsize as usize;
-        writer.write(&self.data[off..off + len])?;
+        let mut off = self.header.sizeofcmds as usize + std::mem::size_of::<Header64>();
 
-        // Write custom data
+        let len = self.rest_size as usize - self.seg.cmdsize as usize;
+        writer.write_all(&self.data[off..off + len])?;
+
+        off += len;
+
         if let Some(sectdata) = self.sectdata {
-            writer.write(&sectdata)?;
+            writer.write_all(&sectdata)?;
             if self.seg.filesize > sectdata.len() as u64 {
                 let padding = vec![0; (self.seg.filesize - sectdata.len() as u64) as usize];
-                writer.write(&padding)?;
+                writer.write_all(&padding)?;
             }
         }
 
-        // Write __LINKEDIT data
-        writer.write(&self.data[off + len..off + len + self.linkedit_cmd.filesize as usize])?;
-
-        println!(
-            "Total size: {}",
-            off + len + self.linkedit_cmd.filesize as usize
-        );
+        writer.write_all(&self.data[off..off + self.linkedit_cmd.filesize as usize])?;
 
         Ok(())
     }
 }
 
-pub fn inject_macho(
-    macho: &[u8],
-    name: &str,
-    sectname: &str,
-    sectdata: &[u8],
-    outfile: &str,
-) -> Result<(), String> {
-    let header = unsafe { &mut *(macho.as_ptr() as *mut Header64) };
-
-    let mut linkedit_cmd = None;
-
-    let mut segment = unsafe { macho.as_ptr().add(std::mem::size_of::<Header64>()) };
-
-    let mut commands = Vec::new();
-    for _ in 0..header.ncmds {
-        let cmd = unsafe { &mut *(segment as *mut SegmentCommand64) };
-        if cmd.cmd == LC_SEGMENT_64 {
-            let segname = unsafe { std::ffi::CStr::from_ptr(cmd.segname.as_ptr() as *const i8) };
-            if segname.to_bytes() == SEG_LINKEDIT {
-                linkedit_cmd = Some(unsafe { &mut *(cmd as *mut SegmentCommand64) });
-            }
-        }
-
-        segment = unsafe { segment.add(cmd.cmdsize as usize) };
-        commands.push(cmd);
-    }
-    println!("commands: {:?}", commands.len());
-
-    let Some(linkedit_cmd) = linkedit_cmd else {
-        return Err("Failed to find __LINKEDIT segment".to_string());
-    };
-
-    println!("linkedit_cmd: {:?}", linkedit_cmd);
-    let rest_datasize =
-        linkedit_cmd.fileoff - std::mem::size_of::<Header64>() as u64 - header.sizeofcmds as u64;
-
-    let mut seg = unsafe { std::mem::zeroed::<SegmentCommand64>() };
-    let mut sec = unsafe { std::mem::zeroed::<Section64>() };
-
-    seg.cmd = LC_SEGMENT_64;
-    seg.cmdsize =
-        std::mem::size_of::<SegmentCommand64>() as u32 + std::mem::size_of::<Section64>() as u32;
-
-    // Copy segment name
-    let segname = name.as_bytes();
-    for i in 0..segname.len() {
-        seg.segname[i] = segname[i] as u8;
-    }
-
-    seg.vmaddr = linkedit_cmd.vmaddr;
-    seg.vmsize = align_vmsize(sectdata.len() as u64);
-    seg.fileoff = linkedit_cmd.fileoff;
-    seg.filesize = seg.vmsize;
-    seg.maxprot = 0x01;
-    seg.initprot = seg.maxprot;
-    seg.nsects = 1;
-
-    // Copy section name
-    let sectname = sectname.as_bytes();
-    for i in 0..sectname.len() {
-        sec.sectname[i] = sectname[i] as u8;
-    }
-    // Copy segment name
-    for i in 0..segname.len() {
-        sec.segname[i] = segname[i] as u8;
-    }
-
-    sec.addr = seg.vmaddr;
-    sec.size = sectdata.len() as u64;
-    sec.offset = seg.fileoff as u32;
-    sec.align = if sec.size < 16 { 0 } else { 4 };
-
-    linkedit_cmd.vmaddr += seg.vmsize;
-    let linkedit_fileoff = linkedit_cmd.fileoff;
-    linkedit_cmd.fileoff += seg.filesize;
-
-    fn shift(value: u64, amount: u64, range_min: u64, range_max: u64) -> u64 {
-        if value < range_min || value > (range_max + range_min) {
-            return value;
-        }
-        value + amount
-    }
-
-    macro_rules! shift_cmd {
-        ($cmd:expr) => {
-            $cmd = shift(
-                $cmd as _,
-                seg.filesize,
-                linkedit_fileoff,
-                linkedit_cmd.filesize,
-            ) as _;
-        };
-    }
-
-    const LC_SYMTAB: u32 = 0x2;
-    const LC_DYSYMTAB: u32 = 0xb;
-    const LC_CODE_SIGNATURE: u32 = 0x1d;
-    const LC_FUNCTION_STARTS: u32 = 0x26;
-    const LC_DATA_IN_CODE: u32 = 0x29;
-    const LC_DYLD_INFO: u32 = 0x22;
-    const LC_DYLD_INFO_ONLY: u32 = 0x80000022;
-    const LC_DYLIB_CODE_SIGN_DRS: u32 = 0x2b;
-    const LC_LINKER_OPTIMIZATION_HINT: u32 = 0x2d;
-    const LC_DYLD_EXPORTS_TRIE: u32 = 0x8000001e;
-    const LC_DYLD_CHAINED_FIXUPS: u32 = 0x80000034;
-
-    for cmd in commands.iter_mut() {
-        match cmd.cmd {
-            LC_SYMTAB => {
-                #[repr(C)]
-                pub struct SymtabCommand {
-                    pub cmd: u32,
-                    pub cmdsize: u32,
-                    pub symoff: u32,
-                    pub nsyms: u32,
-                    pub stroff: u32,
-                    pub strsize: u32,
-                }
-
-                let cmd = unsafe { &mut *(*cmd as *mut _ as *mut SymtabCommand) };
-                shift_cmd!(cmd.symoff);
-                shift_cmd!(cmd.stroff);
-            }
-            LC_DYSYMTAB => {
-                #[repr(C)]
-                pub struct DysymtabCommand {
-                    pub cmd: u32,
-                    pub cmdsize: u32,
-                    pub ilocalsym: u32,
-                    pub nlocalsym: u32,
-                    pub iextdefsym: u32,
-                    pub nextdefsym: u32,
-                    pub iundefsym: u32,
-                    pub nundefsym: u32,
-                    pub tocoff: u32,
-                    pub ntoc: u32,
-                    pub modtaboff: u32,
-                    pub nmodtab: u32,
-                    pub extrefsymoff: u32,
-                    pub nextrefsyms: u32,
-                    pub indirectsymoff: u32,
-                    pub nindirectsyms: u32,
-                    pub extreloff: u32,
-                    pub nextrel: u32,
-                    pub locreloff: u32,
-                    pub nlocrel: u32,
-                }
-
-                let cmd = unsafe { &mut *(*cmd as *mut _ as *mut DysymtabCommand) };
-                shift_cmd!(cmd.tocoff);
-                shift_cmd!(cmd.modtaboff);
-                shift_cmd!(cmd.extrefsymoff);
-                shift_cmd!(cmd.indirectsymoff);
-                shift_cmd!(cmd.extreloff);
-                shift_cmd!(cmd.locreloff);
-            }
-
-            LC_CODE_SIGNATURE
-            | LC_FUNCTION_STARTS
-            | LC_DATA_IN_CODE
-            | LC_DYLIB_CODE_SIGN_DRS
-            | LC_LINKER_OPTIMIZATION_HINT
-            | LC_DYLD_EXPORTS_TRIE
-            | LC_DYLD_CHAINED_FIXUPS => {
-                #[repr(C)]
-                struct LinkeditDataCommand {
-                    cmd: u32,
-                    cmdsize: u32,
-                    dataoff: u32,
-                    datasize: u32,
-                }
-                let cmd = unsafe { &mut *(*cmd as *mut _ as *mut LinkeditDataCommand) };
-                shift_cmd!(cmd.dataoff);
-            }
-
-            LC_DYLD_INFO | LC_DYLD_INFO_ONLY => {
-                #[repr(C)]
-                pub struct DyldInfoCommand {
-                    pub cmd: u32,
-                    pub cmdsize: u32,
-                    pub rebase_off: u32,
-                    pub rebase_size: u32,
-                    pub bind_off: u32,
-                    pub bind_size: u32,
-                    pub weak_bind_off: u32,
-                    pub weak_bind_size: u32,
-                    pub lazy_bind_off: u32,
-                    pub lazy_bind_size: u32,
-                    pub export_off: u32,
-                    pub export_size: u32,
-                }
-                let dyld_info = unsafe { &mut *(*cmd as *mut _ as *mut DyldInfoCommand) };
-                shift_cmd!(dyld_info.rebase_off);
-                shift_cmd!(dyld_info.bind_off);
-                shift_cmd!(dyld_info.weak_bind_off);
-                shift_cmd!(dyld_info.lazy_bind_off);
-                shift_cmd!(dyld_info.export_off);
-            }
-
-            _ => {}
-        }
-    }
-
-    header.ncmds += 1;
-    header.sizeofcmds += seg.cmdsize;
-
-    println!("seg: {:?}", seg);
-
-    let fout = unsafe { libc::fopen(outfile.as_ptr() as *const _, "wb".as_ptr() as *const _) };
-
-    use libc::fwrite;
-    let mut finoff = macho.as_ptr() as *const _;
-    // Write header
-    unsafe {
-        fwrite(finoff, 1, std::mem::size_of::<Header64>(), fout);
-        finoff = finoff.add(std::mem::size_of::<Header64>());
-    }
-
-    // Write commands
-    for cmd in commands.iter() {
-        if *cmd as *const _ == linkedit_cmd as *const _ {
-            unsafe {
-                fwrite(
-                    &seg as *const _ as *const _,
-                    1,
-                    std::mem::size_of::<SegmentCommand64>(),
-                    fout,
-                );
-                fwrite(
-                    &sec as *const _ as *const _,
-                    1,
-                    std::mem::size_of::<Section64>(),
-                    fout,
-                );
-            }
-        }
-        unsafe {
-            fwrite(*cmd as *const _ as _, 1, (*cmd).cmdsize as usize, fout);
-        }
-    }
-
-    unsafe {
-        finoff = finoff.add(header.sizeofcmds as usize);
-    }
-
-    // Write rest of the data
-    unsafe {
-        fwrite(
-            finoff,
-            1,
-            rest_datasize as usize - seg.cmdsize as usize,
-            fout,
-        );
-        finoff = finoff.add(rest_datasize as usize - seg.cmdsize as usize);
-    }
-
-    // Write custom data
-    unsafe {
-        fwrite(sectdata.as_ptr() as *const _, 1, sectdata.len(), fout);
-        if seg.filesize > sectdata.len() as u64 {
-            let padding = vec![0; (seg.filesize - sectdata.len() as u64) as usize];
-            fwrite(padding.as_ptr() as *const _, 1, padding.len(), fout);
-        }
-    }
-
-    // Write __LINKEDIT data
-    unsafe {
-        fwrite(finoff, 1, linkedit_cmd.filesize as usize, fout);
-        finoff = finoff.add(linkedit_cmd.filesize as usize);
-    }
-
-    println!("Total size: {}", finoff as usize - macho.as_ptr() as usize);
-
-    Ok(())
+pub struct Elf<'a> {
+    data: &'a [u8],
 }
 
-// elf
-pub fn inject_elf(elf: &[u8], _name: &str, sectdata: &[u8], outfile: &str) -> Result<(), String> {
-    let mut elf = elf.to_vec();
-    elf.extend_from_slice(sectdata);
-    const MAGIC: u32 = 0x501e;
+impl<'a> Elf<'a> {
+    pub fn new(data: &'a [u8]) -> Self {
+        Self { data }
+    }
 
-    elf.extend_from_slice(&MAGIC.to_le_bytes());
-    elf.extend_from_slice(&(sectdata.len() as u32 + 8).to_le_bytes());
+    pub fn append<W: Write>(&self, sectdata: &[u8], writer: &mut W) -> Result<(), Error> {
+        let mut elf = self.data.to_vec();
+        elf.extend_from_slice(sectdata);
+        const MAGIC: u32 = 0x501e;
 
-    std::fs::write(outfile, elf).unwrap();
+        elf.extend_from_slice(&MAGIC.to_le_bytes());
+        elf.extend_from_slice(&(sectdata.len() as u32 + 8).to_le_bytes());
 
-    Ok(())
+        writer.write_all(&elf)?;
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -860,8 +592,25 @@ mod elf {
         let mut buf = Vec::new();
         file.read_to_end(&mut buf).unwrap();
 
-        buf = buf[..buf.len() - 9].to_vec();
+        buf = buf[..buf.len() - 8].to_vec();
 
         return Some(buf);
+    }
+}
+
+pub mod utils {
+    pub fn is_elf(data: &[u8]) -> bool {
+        let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        magic == 0x7f454c46
+    }
+
+    pub fn is_macho(data: &[u8]) -> bool {
+        let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        magic == 0xfeedfacf
+    }
+
+    pub fn is_pe(data: &[u8]) -> bool {
+        let magic = u16::from_le_bytes([data[0], data[1]]);
+        magic == 0x5a4d
     }
 }
