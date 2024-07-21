@@ -18,9 +18,7 @@ jobs:
 
     steps:
     - uses: actions/checkout@v3
+    - name: Lint
+      run: cargo clippy --all-targets --all-features -- -D warnings
     - name: Build
-      run: cargo b -vv
-    - name: Build cli
-      run: |
-        cd cli
-        cargo b -vv
+      run: cargo b --all-targets --all-features
