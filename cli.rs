@@ -10,7 +10,7 @@ const HELP: &str = r#"Usage: sui <exe> <data_file> <output>"#;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(section) = find_section("__SUI") {
         println!("Found section");
-        println!("{}", std::str::from_utf8(&section)?);
+        println!("{}", std::str::from_utf8(section)?);
         return Ok(());
     }
 
