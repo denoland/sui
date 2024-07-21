@@ -22,6 +22,27 @@
  * THE SOFTWARE.
  */
 
+//! Sui is a library for embedding and extracting auxillary data from binary files.
+//!
+//! # Examples
+//!
+//! Embedding data in a Mach-O binary:
+//! ```rust
+//! use libsui::Macho;
+//! use std::fs::File;
+//!
+//! # fn main() -> Result<(), libsui::Error> {
+//! let data = b"Hello, world!";
+//! let exe = std::fs::read("tests/exec_mach64")?;
+//! let mut out = File::create("out")?;
+//!
+//! Macho::from(exe)?
+//!     .write_section("__SECTION", data.to_vec())?
+//!     .build(&mut out)?;
+//! #     Ok(())
+//! # }
+//! ```
+
 use core::mem::size_of;
 use editpe::{
     constants::{LANGUAGE_ID_EN_US, RT_RCDATA},
@@ -173,51 +194,52 @@ mod pe {
 
 #[repr(C)]
 #[derive(Debug, Clone, FromBytes, FromZeroes, AsBytes)]
-pub struct SegmentCommand64 {
-    pub cmd: u32,
-    pub cmdsize: u32,
-    pub segname: [u8; 16],
-    pub vmaddr: u64,
-    pub vmsize: u64,
-    pub fileoff: u64,
-    pub filesize: u64,
-    pub maxprot: u32,
-    pub initprot: u32,
-    pub nsects: u32,
-    pub flags: u32,
+struct SegmentCommand64 {
+    cmd: u32,
+    cmdsize: u32,
+    segname: [u8; 16],
+    vmaddr: u64,
+    vmsize: u64,
+    fileoff: u64,
+    filesize: u64,
+    maxprot: u32,
+    initprot: u32,
+    nsects: u32,
+    flags: u32,
 }
 
 #[derive(FromBytes, FromZeroes, AsBytes)]
 #[repr(C)]
-pub struct Header64 {
-    pub magic: u32,
-    pub cputype: u32,
-    pub cpusubtype: u32,
-    pub filetype: u32,
-    pub ncmds: u32,
-    pub sizeofcmds: u32,
-    pub flags: u32,
-    pub reserved: u32,
+struct Header64 {
+    magic: u32,
+    cputype: u32,
+    cpusubtype: u32,
+    filetype: u32,
+    ncmds: u32,
+    sizeofcmds: u32,
+    flags: u32,
+    reserved: u32,
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, FromBytes, FromZeroes, AsBytes)]
-pub struct Section64 {
-    pub sectname: [u8; 16],
-    pub segname: [u8; 16],
-    pub addr: u64,
-    pub size: u64,
-    pub offset: u32,
-    pub align: u32,
-    pub reloff: u32,
-    pub nreloc: u32,
-    pub flags: u32,
-    pub reserved1: u32,
-    pub reserved2: u32,
-    pub reserved3: u32,
+struct Section64 {
+    sectname: [u8; 16],
+    segname: [u8; 16],
+    addr: u64,
+    size: u64,
+    offset: u32,
+    align: u32,
+    reloff: u32,
+    nreloc: u32,
+    flags: u32,
+    reserved1: u32,
+    reserved2: u32,
+    reserved3: u32,
 }
 
 const SEG_LINKEDIT: &[u8] = b"__LINKEDIT";
+
 const LC_SEGMENT_64: u32 = 0x19;
 const LC_SYMTAB: u32 = 0x2;
 const LC_DYSYMTAB: u32 = 0xb;
