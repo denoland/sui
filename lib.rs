@@ -253,6 +253,8 @@ const LC_LINKER_OPTIMIZATION_HINT: u32 = 0x2d;
 const LC_DYLD_EXPORTS_TRIE: u32 = 0x8000001e;
 const LC_DYLD_CHAINED_FIXUPS: u32 = 0x80000034;
 
+const CPU_TYPE_ARM: u32 = 12;
+
 fn align(size: u64, base: u64) -> u64 {
     let over = size % base;
     if over == 0 {
@@ -262,8 +264,8 @@ fn align(size: u64, base: u64) -> u64 {
     }
 }
 
-fn align_vmsize(size: u64) -> u64 {
-    align(if size > 0x4000 { size } else { 0x4000 }, 0x1000)
+fn align_vmsize(size: u64, page_size: u64) -> u64 {
+    align(if size > 0x4000 { size } else { 0x4000 }, page_size)
 }
 
 fn shift(value: u64, amount: u64, range_min: u64, range_max: u64) -> u64 {
@@ -337,13 +339,19 @@ impl Macho {
     }
 
     pub fn write_section(mut self, name: &str, sectdata: Vec<u8>) -> Result<Self, Error> {
+        let page_size = if self.header.cputype & CPU_TYPE_ARM != 0 {
+            0x10000
+        } else {
+            0x1000
+        };
+
         self.seg = SegmentCommand64 {
             cmd: LC_SEGMENT_64,
             cmdsize: size_of::<SegmentCommand64>() as u32 + size_of::<Section64>() as u32,
             segname: SEGNAME,
             vmaddr: self.linkedit_cmd.vmaddr,
-            vmsize: align_vmsize(sectdata.len() as u64),
-            filesize: align_vmsize(sectdata.len() as u64),
+            vmsize: align_vmsize(sectdata.len() as u64, page_size),
+            filesize: align_vmsize(sectdata.len() as u64, page_size),
             fileoff: self.linkedit_cmd.fileoff,
             maxprot: 0x01,
             initprot: 0x01,
