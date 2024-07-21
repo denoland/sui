@@ -62,6 +62,7 @@ dependencies = [
  "editpe",
  "libc",
  "windows-sys",
+ "zerocopy",
 ]
 
 [[package]]
