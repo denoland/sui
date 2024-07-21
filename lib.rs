@@ -600,7 +600,7 @@ mod elf {
 
 pub mod utils {
     pub fn is_elf(data: &[u8]) -> bool {
-        let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        let magic = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
         magic == 0x7f454c46
     }
 

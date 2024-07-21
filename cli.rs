@@ -15,15 +15,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 5 {
+    if args.len() != 4 {
         eprintln!("{}", HELP);
         std::process::exit(1);
     }
 
     let exe = std::fs::read(&args[1])?;
-    let data = std::fs::read(&args[3])?;
+    let data = std::fs::read(&args[2])?;
 
-    let mut out = std::fs::File::create(&args[4])?;
+    let mut out = std::fs::File::create(&args[3])?;
 
     if utils::is_pe(&exe) {
         PortableExecutable::from(&exe)?
