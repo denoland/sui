@@ -34,7 +34,7 @@
 //! # fn main() -> Result<(), libsui::Error> {
 //! let data = b"Hello, world!";
 //! let exe = std::fs::read("tests/exec_mach64")?;
-//! let mut out = File::create("out")?;
+//! let mut out = File::create("tests/out")?;
 //!
 //! Macho::from(exe)?
 //!     .write_section("__SECTION", data.to_vec())?
@@ -351,8 +351,8 @@ impl Macho {
             flags: 0,
         };
 
-        // Copy section name
-        let sectname = name.as_bytes();
+        let mut sectname = [0; 16];
+        sectname[..name.len()].copy_from_slice(name.as_bytes());
 
         self.sec = Section64 {
             addr: self.seg.vmaddr,
@@ -360,7 +360,7 @@ impl Macho {
             offset: self.linkedit_cmd.fileoff as u32,
             align: if sectdata.len() < 16 { 0 } else { 4 },
             segname: SEGNAME,
-            sectname: sectname.try_into().map_err(|_| Error::InternalError)?,
+            sectname,
             ..self.sec
         };
 
