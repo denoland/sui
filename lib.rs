@@ -479,7 +479,6 @@ impl Macho {
                 if segcmd.segname[..SEG_LINKEDIT.len()] == *SEG_LINKEDIT {
                     writer.write_all(self.seg.as_bytes())?;
                     writer.write_all(self.sec.as_bytes())?;
-
                     writer.write_all(self.linkedit_cmd.as_bytes())?;
                     continue;
                 }
@@ -575,7 +574,7 @@ mod elf {
     use std::io::Seek;
     use std::io::SeekFrom;
 
-    pub fn find_section(_: &str) -> Option<Vec<u8>> {
+    pub fn find_section(_: &str) -> Option<&[u8]> {
         let exe = std::env::current_exe().unwrap();
 
         let mut file = std::fs::File::open(exe).unwrap();
@@ -595,9 +594,9 @@ mod elf {
         let mut buf = Vec::new();
         file.read_to_end(&mut buf).unwrap();
 
-        buf = buf[..buf.len() - 8].to_vec();
+        let data = buf[..buf.len() - 8].to_vec();
 
-        Some(buf)
+        Some(Box::leak(data.into_boxed_slice()))
     }
 }
 
