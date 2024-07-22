@@ -35,8 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         Macho::from(exe)?
             .write_section("__SUI", data)?
-            //.build_and_sign(&settings, &mut out)?;
-            .build(&mut out)?;
+            .build_and_sign(&settings, &mut out)?;
     } else if utils::is_elf(&exe) {
         Elf::new(&exe).append(&data, &mut out)?;
     } else {

@@ -63,6 +63,15 @@ pub enum Error {
     InvalidObject(&'static str),
     InternalError,
     IoError(std::io::Error),
+    #[cfg(feature = "apple-codesign")]
+    AppleCodesignError(apple_codesign::AppleCodesignError),
+}
+
+#[cfg(feature = "apple-codesign")]
+impl From<apple_codesign::AppleCodesignError> for Error {
+    fn from(err: apple_codesign::AppleCodesignError) -> Self {
+        Error::AppleCodesignError(err)
+    }
 }
 
 impl std::fmt::Display for Error {
@@ -71,6 +80,8 @@ impl std::fmt::Display for Error {
             Error::InvalidObject(msg) => write!(f, "Invalid object: {}", msg),
             Error::InternalError => write!(f, "Internal error"),
             Error::IoError(err) => write!(f, "I/O error: {}", err),
+            #[cfg(feature = "apple-codesign")]
+            Error::AppleCodesignError(err) => write!(f, "Apple codesign error: {}", err),
         }
     }
 }
@@ -545,8 +556,8 @@ impl Macho {
         let mut writer = Vec::new();
         self.build(&mut writer)?;
 
-        let signer = apple_codesign::MachOSigner::new(&writer).unwrap();
-        signer.write_signed_binary(&settings, out).unwrap();
+        let signer = apple_codesign::MachOSigner::new(&writer)?;
+        signer.write_signed_binary(settings, out)?;
 
         Ok(())
     }
