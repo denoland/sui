@@ -102,7 +102,7 @@ impl<'a> PortableExecutable<'a> {
 
     /// Write a resource to the PE file
     pub fn write_resource(mut self, name: &str, sectdata: Vec<u8>) -> Result<Self, Error> {
-        let mut resources = self.image.resource_directory().cloned().unwrap_or_default();
+        let mut resources = editpe::ResourceDirectory::default();
         let root = resources.root_mut();
         if root.get(ResourceEntryName::ID(RT_RCDATA as u32)).is_none() {
             root.insert(
