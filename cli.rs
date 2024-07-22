@@ -30,12 +30,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .write_resource("_SUI", data)?
             .build(&mut out)?;
     } else if utils::is_macho(&exe) {
-        let mut settings = apple_codesign::SigningSettings::default();
-        settings.set_binary_identifier(apple_codesign::SettingsScope::Main, "sui");
-
         Macho::from(exe)?
             .write_section("__SUI", data)?
-            .build_and_sign(&settings, &mut out)?;
+            .build(&mut out)?;
     } else if utils::is_elf(&exe) {
         Elf::new(&exe).append(&data, &mut out)?;
     } else {
