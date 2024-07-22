@@ -7,15 +7,10 @@ description = "A injection tool for executable formats (ELF, PE, Mach-O) that al
 homepage = "https://sui.littledivy.com"
 repository = "https://github.com/littledivy/sui"
 
-[features]
-default = ["apple-codesign"]
-apple-codesign = ["dep:apple-codesign"]
-
 [dependencies]
 libc = "0.2"
 editpe = { version = "0.1.0", default-features = false }
 zerocopy = { version = "0.7", features = ["derive"] }
-apple-codesign = { version = "0.27.0", default-features = false, optional = true }
 
 # object = { version = "0.36.1", features = ["build"] }
 
