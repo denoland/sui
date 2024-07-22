@@ -535,6 +535,21 @@ impl Macho {
 
         Ok(())
     }
+
+    #[cfg(feature = "apple-codesign")]
+    pub fn build_and_sign<W: Write>(
+        self,
+        settings: &apple_codesign::SigningSettings,
+        out: &mut W,
+    ) -> Result<(), Error> {
+        let mut writer = Vec::new();
+        self.build(&mut writer)?;
+
+        let signer = apple_codesign::MachOSigner::new(&writer).unwrap();
+        signer.write_signed_binary(&settings, out).unwrap();
+
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "macos")]
