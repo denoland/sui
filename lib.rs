@@ -542,9 +542,13 @@ impl Macho {
     pub fn build_and_sign<W: Write>(self, writer: W) -> Result<(), Error> {
         let mut data = Vec::new();
         self.build(&mut data)?;
-
-        let codesign = apple_codesign::MachoSigner::new(data)?;
-        codesign.sign(writer)
+        if self.header.cputype & CPU_TYPE_ARM != 0 {
+            let codesign = apple_codesign::MachoSigner::new(data)?;
+            codesign.sign(writer)
+        } else {
+            writer.write_all(&data)?;
+            Ok(())
+        }
     }
 }
 
