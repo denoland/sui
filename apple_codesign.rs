@@ -214,9 +214,9 @@ impl MachoSigner {
         };
 
         let mut out = Vec::with_capacity(sz);
-        out.extend_from_slice(&sb.as_bytes());
-        out.extend_from_slice(&blob.as_bytes());
-        out.extend_from_slice(&c_dir.as_bytes());
+        out.extend_from_slice(sb.as_bytes());
+        out.extend_from_slice(blob.as_bytes());
+        out.extend_from_slice(c_dir.as_bytes());
         out.extend_from_slice(id);
 
         let mut fileoff = 0;
