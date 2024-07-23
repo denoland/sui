@@ -51,6 +51,8 @@ use editpe::{
 use std::io::Write;
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
+pub mod apple_codesign;
+
 #[cfg(target_os = "linux")]
 pub use elf::find_section;
 #[cfg(target_os = "macos")]
@@ -194,7 +196,7 @@ mod pe {
 
 #[repr(C)]
 #[derive(Debug, Clone, FromBytes, FromZeroes, AsBytes)]
-struct SegmentCommand64 {
+pub(crate) struct SegmentCommand64 {
     cmd: u32,
     cmdsize: u32,
     segname: [u8; 16],
@@ -210,7 +212,7 @@ struct SegmentCommand64 {
 
 #[derive(FromBytes, FromZeroes, AsBytes)]
 #[repr(C)]
-struct Header64 {
+pub(crate) struct Header64 {
     magic: u32,
     cputype: u32,
     cpusubtype: u32,
@@ -223,7 +225,7 @@ struct Header64 {
 
 #[repr(C)]
 #[derive(Debug, Clone, FromBytes, FromZeroes, AsBytes)]
-struct Section64 {
+pub(crate) struct Section64 {
     sectname: [u8; 16],
     segname: [u8; 16],
     addr: u64,
@@ -243,7 +245,7 @@ const SEG_LINKEDIT: &[u8] = b"__LINKEDIT";
 const LC_SEGMENT_64: u32 = 0x19;
 const LC_SYMTAB: u32 = 0x2;
 const LC_DYSYMTAB: u32 = 0xb;
-const LC_CODE_SIGNATURE: u32 = 0x1d;
+pub(crate) const LC_CODE_SIGNATURE: u32 = 0x1d;
 const LC_FUNCTION_STARTS: u32 = 0x26;
 const LC_DATA_IN_CODE: u32 = 0x29;
 const LC_DYLD_INFO: u32 = 0x22;
@@ -386,6 +388,7 @@ impl Macho {
                 ) as _;
             };
         }
+
         for (cmd, _, offset) in self.commands.iter_mut() {
             match *cmd {
                 LC_SYMTAB => {
@@ -534,6 +537,14 @@ impl Macho {
         writer.write_all(&self.data[off..off + self.linkedit_cmd.filesize as usize])?;
 
         Ok(())
+    }
+
+    pub fn build_and_sign<W: Write>(self, writer: W) -> Result<(), Error> {
+        let mut data = Vec::new();
+        self.build(&mut data)?;
+
+        let codesign = apple_codesign::MachoSigner::new(data)?;
+        codesign.sign(writer)
     }
 }
 

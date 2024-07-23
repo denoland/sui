@@ -32,7 +32,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else if utils::is_macho(&exe) {
         Macho::from(exe)?
             .write_section("__SUI", data)?
-            .build(&mut out)?;
+            .build_and_sign(&mut out)?;
+        //libsui::apple_codesign::MachoSigner::new(exe)?
+        //    .sign(&mut out)?;
     } else if utils::is_elf(&exe) {
         Elf::new(&exe).append(&data, &mut out)?;
     } else {
