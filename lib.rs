@@ -214,7 +214,7 @@ pub(crate) struct SegmentCommand64 {
 #[repr(C)]
 pub(crate) struct Header64 {
     magic: u32,
-    cputype: u32,
+    cputype: i32,
     cpusubtype: u32,
     filetype: u32,
     ncmds: u32,
@@ -255,7 +255,7 @@ const LC_LINKER_OPTIMIZATION_HINT: u32 = 0x2d;
 const LC_DYLD_EXPORTS_TRIE: u32 = 0x8000001e;
 const LC_DYLD_CHAINED_FIXUPS: u32 = 0x80000034;
 
-const CPU_TYPE_ARM: u32 = 12;
+const CPU_TYPE_ARM: i32 = 12;
 
 fn align(size: u64, base: u64) -> u64 {
     let over = size % base;
