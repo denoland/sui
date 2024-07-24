@@ -341,7 +341,7 @@ impl Macho {
     }
 
     pub fn write_section(mut self, name: &str, sectdata: Vec<u8>) -> Result<Self, Error> {
-        let page_size = if self.header.cputype & CPU_TYPE_ARM != 0 {
+        let page_size = if self.header.cputype == CPU_TYPE_ARM {
             0x10000
         } else {
             0x1000
@@ -540,7 +540,7 @@ impl Macho {
     }
 
     pub fn build_and_sign<W: Write>(self, mut writer: W) -> Result<(), Error> {
-        if self.header.cputype & CPU_TYPE_ARM != 0 {
+        if self.header.cputype == CPU_TYPE_ARM {
             let mut data = Vec::new();
             self.build(&mut data)?;
             let codesign = apple_codesign::MachoSigner::new(data)?;
