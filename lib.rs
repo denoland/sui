@@ -255,7 +255,7 @@ const LC_LINKER_OPTIMIZATION_HINT: u32 = 0x2d;
 const LC_DYLD_EXPORTS_TRIE: u32 = 0x8000001e;
 const LC_DYLD_CHAINED_FIXUPS: u32 = 0x80000034;
 
-const CPU_TYPE_ARM: i32 = 12;
+const CPU_TYPE_ARM_64: i32 = 0x0100000c;
 
 fn align(size: u64, base: u64) -> u64 {
     let over = size % base;
@@ -341,7 +341,7 @@ impl Macho {
     }
 
     pub fn write_section(mut self, name: &str, sectdata: Vec<u8>) -> Result<Self, Error> {
-        let page_size = if self.header.cputype == CPU_TYPE_ARM {
+        let page_size = if self.header.cputype == CPU_TYPE_ARM_64 {
             0x10000
         } else {
             0x1000
@@ -540,7 +540,7 @@ impl Macho {
     }
 
     pub fn build_and_sign<W: Write>(self, mut writer: W) -> Result<(), Error> {
-        if self.header.cputype == CPU_TYPE_ARM {
+        if self.header.cputype == CPU_TYPE_ARM_64 {
             let mut data = Vec::new();
             self.build(&mut data)?;
             let codesign = apple_codesign::MachoSigner::new(data)?;
