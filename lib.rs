@@ -121,8 +121,9 @@ impl<'a> PortableExecutable<'a> {
                 return Err(Error::InvalidObject("RCDATA is not a table"));
             }
         };
+        let name = name.to_uppercase();
         rc_table.insert(
-            editpe::ResourceEntryName::from_string(name),
+            editpe::ResourceEntryName::from_string(name.clone()),
             ResourceEntry::Table(ResourceTable::default()),
         );
 
@@ -165,7 +166,7 @@ mod pe {
     };
 
     pub fn find_section(section_name: &str) -> Option<&[u8]> {
-        let Ok(section_name) = CString::new(section_name) else {
+        let Ok(section_name) = CString::new(section_name.to_uppercase()) else {
             return None;
         };
 
