@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if utils::is_pe(&exe) {
         PortableExecutable::from(&exe)?
-            .write_resource("_SUI", data)?
+            .write_resource("__SUI", data)?
             .build(&mut out)?;
     } else if utils::is_macho(&exe) {
         Macho::from(exe)?
