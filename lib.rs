@@ -165,7 +165,7 @@ mod pe {
     };
 
     pub fn find_section(section_name: &str) -> Option<&[u8]> {
-        let Ok(section_name) = CString::new(section_name.to_uppercase()) else {
+        let Ok(section_name) = CString::new(section_name) else {
             return None;
         };
 
