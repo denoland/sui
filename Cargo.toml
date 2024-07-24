@@ -1,6 +1,6 @@
 [package]
 name = "libsui"
-version = "0.0.3"
+version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "A injection tool for executable formats (ELF, PE, Mach-O) that allows you to embed files into existing binary and extract them at runtime"
