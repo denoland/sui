@@ -121,8 +121,9 @@ impl<'a> PortableExecutable<'a> {
                 return Err(Error::InvalidObject("RCDATA is not a table"));
             }
         };
+        let name = name.to_uppercase();
         rc_table.insert(
-            editpe::ResourceEntryName::from_string(name),
+            editpe::ResourceEntryName::from_string(name.clone()),
             ResourceEntry::Table(ResourceTable::default()),
         );
 
