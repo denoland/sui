@@ -1,7 +1,8 @@
 /*
  * "Ad-hoc code signing for Mach-O binaries"
  *
- * Copyright (c) 2024 Divy Srivastaa
+ * Copyright (c) 2024 Divy Srivastava
+ * Copyright (c) 2024 the Deno authors
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal

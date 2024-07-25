@@ -1,11 +1,11 @@
 [package]
 name = "libsui"
 version = "0.1.0"
+authors = ["the Deno authors"]
 edition = "2021"
 license = "MIT"
 description = "A injection tool for executable formats (ELF, PE, Mach-O) that allows you to embed files into existing binary and extract them at runtime"
-homepage = "https://sui.littledivy.com"
-repository = "https://github.com/littledivy/sui"
+repository = "https://github.com/denoland/sui"
 
 [dependencies]
 libc = "0.2"
