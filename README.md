@@ -3,11 +3,17 @@
 [Documentation](https://docs.rs/libsui) | [Usage](cli.rs)
 
 _Sui (सुई)_ is a injection tool for executable formats (ELF, PE, Mach-O) that
- allows you to embed files into existing binary and extract them at runtime. 
+allows you to embed files into existing binary and extract them at runtime.
 
 It produces valid executables that can be code signed on macOS and Windows.
 
-## Usage
+### Usage
+
+```
+cargo add libsui
+```
+
+Embedding data into binaries:
 
 ```rust
 use libsui::{Macho, PortableExecutable};
@@ -18,9 +24,7 @@ let mut out = std::fs::File::create("out")?;
 Macho::from(exe)?
     .write_section("__hello", b"Hello, World!".to_vec())?
     .build(&mut out)?;
-```
 
-```rust
 let exe = std::fs::read("tests/exec_pe64")?;
 let mut out = std::fs::File::create("out.exe")?;
 
@@ -37,18 +41,21 @@ use libsui::find_section;
 let data = find_section("hello.txt")?;
 ```
 
-## Design
+### Design
 
-### Mach-O
+#### Mach-O
 
-Resource is added as section in a new segment, load commands are updated and offsets are adjusted. `__LINKEDIT` is kept at the end of the file.
+Resource is added as section in a new segment, load commands are updated and
+offsets are adjusted. `__LINKEDIT` is kept at the end of the file.
 
 It is similar to linker's `-sectcreate,__FOO,__foo,hello.txt` option.
 
-Note that `Macho::build` will invalidate existing code signature. on Apple sillicon, kernel refuses to run executables with bad signatures.
+Note that `Macho::build` will invalidate existing code signature. on Apple
+sillicon, kernel refuses to run executables with bad signatures.
 
-Use `Macho::build_and_sign` to re-sign the binary with ad-hoc signature. See [`apple_codesign.rs`](./apple_codesign.rs) for details. This is similar to `codesign -s - ./out` command.
-
+Use `Macho::build_and_sign` to re-sign the binary with ad-hoc signature. See
+[`apple_codesign.rs`](./apple_codesign.rs) for details. This is similar to
+`codesign -s - ./out` command.
 
 ```rust
 Macho::from(exe)?
@@ -77,13 +84,19 @@ Sealed Resources=none
 Internal requirements=none
 ```
 
-### PE
+#### PE
 
-Resource is added into a new PE resource directory as `RT_RCDATA` type and extracted using `FindResource` and `LoadResource` at run-time.
+Resource is added into a new PE resource directory as `RT_RCDATA` type and
+extracted using `FindResource` and `LoadResource` at run-time.
 
-### ELF
+#### ELF
 
-Data is simply appended to the end of the file and extracted from `current_exe()` at run-time. 
+Data is simply appended to the end of the file and extracted from
+`current_exe()` at run-time.
 
-This is subject to change and may use ELF linker notes (`PT_NOTE`) in the future.
+This is subject to change and may use ELF linker notes (`PT_NOTE`) in the
+future.
 
+### License
+
+MIT
