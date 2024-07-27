@@ -62,7 +62,7 @@ fn test_macho(size: usize, sign: bool) {
     #[cfg(target_os = "macos")]
     let mut out = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
+        .truncate(true)
         .mode(0o755)
         .open(&_path)
         .unwrap();
@@ -90,7 +90,7 @@ fn test_macho(size: usize, sign: bool) {
                 .arg(&_path)
                 .output()
                 .unwrap();
-            assert_eq!(output.status.success(), true);
+            assert!(output.status.success());
         }
     }
 }
@@ -202,15 +202,15 @@ fn utils() {
     let macho = std::fs::read("tests/exec_mach64").unwrap();
     let pe = std::fs::read("tests/exec_pe64").unwrap();
 
-    assert_eq!(utils::is_elf(&elf), true);
-    assert_eq!(utils::is_macho(&macho), true);
-    assert_eq!(utils::is_pe(&pe), true);
+    assert!(utils::is_elf(&elf));
+    assert!(utils::is_macho(&macho));
+    assert!(utils::is_pe(&pe));
 
-    assert_eq!(utils::is_elf(&macho), false);
-    assert_eq!(utils::is_macho(&elf), false);
-    assert_eq!(utils::is_pe(&elf), false);
+    assert!(!utils::is_elf(&macho));
+    assert!(!utils::is_macho(&elf));
+    assert!(!utils::is_pe(&elf));
 
-    assert_eq!(utils::is_elf(&pe), false);
-    assert_eq!(utils::is_macho(&pe), false);
-    assert_eq!(utils::is_pe(&macho), false);
+    assert!(!utils::is_elf(&pe));
+    assert!(!utils::is_macho(&pe));
+    assert!(!utils::is_pe(&macho));
 }
