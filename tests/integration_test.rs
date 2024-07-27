@@ -18,7 +18,8 @@ use std::os::unix::fs::OpenOptionsExt;
 
 fn test_macho(size: usize) {
     let input = std::fs::read("tests/exec_mach64").unwrap();
-    let mut macho = Macho::from(input).unwrap();
+    let macho = Macho::from(input).unwrap();
+    let _path = std::env::temp_dir().join("exec_mach64_out");
 
     let data = vec![0; size];
     #[cfg(not(target_os = "macos"))]
@@ -28,7 +29,7 @@ fn test_macho(size: usize) {
         .write(true)
         .create(true)
         .mode(0o755)
-        .open(&std::env::temp_dir().join("exec_mach64_out"))
+        .open(&_path)
         .unwrap();
     macho
         .write_section(RESOURCE_NAME, data)
@@ -36,13 +37,11 @@ fn test_macho(size: usize) {
         .build_and_sign(&mut out)
         .unwrap();
 
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         drop(out);
         // Run the output
-        let output = std::process::Command::new("tests/exec_mach64_out")
-            .output()
-            .unwrap();
+        let output = std::process::Command::new(&_path).output().unwrap();
         assert_eq!(output.status.success(), true);
     }
 }
@@ -62,6 +61,7 @@ data_size_tests! {
 fn test_elf(size: usize) {
     let input = std::fs::read("tests/exec_elf64").unwrap();
     let elf = Elf::new(&input);
+    let _path = std::env::temp_dir().join("exec_elf64_out");
 
     let data = vec![0; size];
     #[cfg(not(target_os = "linux"))]
@@ -71,7 +71,7 @@ fn test_elf(size: usize) {
         .write(true)
         .create(true)
         .mode(0o755)
-        .open(&std::env::temp_dir().join("exec_elf64_out"))
+        .open(&_path)
         .unwrap();
 
     elf.append(&data, &mut out).unwrap();
@@ -80,9 +80,7 @@ fn test_elf(size: usize) {
     {
         drop(out);
         // Run the output
-        let output = std::process::Command::new("tests/exec_elf64_out")
-            .output()
-            .unwrap();
+        let output = std::process::Command::new(&_path).output().unwrap();
         assert_eq!(output.status.success(), true);
     }
 }
@@ -99,16 +97,36 @@ data_size_tests! {
     test_elf_1024_1024_5 : 1024 * 1024 * 5
 }
 
+static PROCESS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn test_pe(size: usize) {
+    let _lock = PROCESS_LOCK.lock().unwrap();
+
     let input = std::fs::read("tests/exec_pe64").unwrap();
-    let mut pe = PortableExecutable::from(&input).unwrap();
+    let pe = PortableExecutable::from(&input).unwrap();
+    let _path = std::env::temp_dir().join("exec_pe64_out");
 
     let data = vec![0; size];
+    #[cfg(not(target_os = "windows"))]
     let mut out = std::io::sink();
+    #[cfg(target_os = "windows")]
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .open(&_path)
+        .unwrap();
     pe.write_resource(RESOURCE_NAME, data)
         .unwrap()
         .build(&mut out)
         .unwrap();
+
+    #[cfg(target_os = "windows")]
+    {
+        drop(out);
+        // Run the output
+        let output = std::process::Command::new(&_path).output().unwrap();
+        assert_eq!(output.status.success(), true);
+    }
 }
 
 data_size_tests! {
