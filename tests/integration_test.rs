@@ -140,7 +140,7 @@ fn test_elf(size: usize) {
         drop(out);
         // Run the output
         let output = std::process::Command::new(&_path).output().unwrap();
-        assert_eq!(output.status.success(), true);
+        assert!(output.status.success());
     }
 }
 
@@ -180,7 +180,7 @@ fn test_pe(size: usize) {
         drop(out);
         // Run the output
         let output = std::process::Command::new(&_path).output().unwrap();
-        assert_eq!(output.status.success(), true);
+        assert!(output.status.success());
     }
 }
 
