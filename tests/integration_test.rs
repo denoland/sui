@@ -78,6 +78,8 @@ fn test_macho(size: usize, sign: bool) {
         drop(out);
         // Run the output
         let output = std::process::Command::new(&_path).output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        println!("{}", stderr);
         assert_eq!(output.status.success(), sign);
 
         if sign {
