@@ -17,6 +17,8 @@ macro_rules! data_size_tests {
 use std::os::unix::fs::OpenOptionsExt;
 
 fn test_macho(size: usize) {
+    let _lock = PROCESS_LOCK.lock().unwrap();
+
     let input = std::fs::read("tests/exec_mach64").unwrap();
     let macho = Macho::from(input).unwrap();
     let _path = std::env::temp_dir().join("exec_mach64_out");
@@ -59,6 +61,8 @@ data_size_tests! {
 }
 
 fn test_elf(size: usize) {
+    let _lock = PROCESS_LOCK.lock().unwrap();
+
     let input = std::fs::read("tests/exec_elf64").unwrap();
     let elf = Elf::new(&input);
     let _path = std::env::temp_dir().join("exec_elf64_out");
