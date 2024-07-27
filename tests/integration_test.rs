@@ -128,7 +128,7 @@ fn test_elf(size: usize) {
     #[cfg(target_os = "linux")]
     let mut out = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
+        .truncate(true)
         .mode(0o755)
         .open(&_path)
         .unwrap();
@@ -167,7 +167,7 @@ fn test_pe(size: usize) {
     #[cfg(target_os = "windows")]
     let mut out = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
+        .truncate(true)
         .open(&_path)
         .unwrap();
     pe.write_resource(RESOURCE_NAME, data)
