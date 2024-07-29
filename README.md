@@ -1,13 +1,15 @@
-[![Crates.io](https://img.shields.io/crates/v/libsui.svg)](https://crates.io/crates/libsui)
+# `libsui`
 
-[Documentation](https://docs.rs/libsui) | [Usage](cli.rs)
+[![Crates.io](https://img.shields.io/crates/v/libsui.svg)](https://crates.io/crates/libsui)
 
 _Sui (सुई)_ is a injection tool for executable formats (ELF, PE, Mach-O) that
 allows you to embed files into existing binary and extract them at runtime.
 
 It produces valid executables that can be code signed on macOS and Windows.
 
-### Usage
+[Documentation](https://docs.rs/libsui) | [Usage](cli.rs)
+
+## Usage
 
 ```
 cargo add libsui
@@ -41,9 +43,9 @@ use libsui::find_section;
 let data = find_section("hello.txt")?;
 ```
 
-### Design
+## Design
 
-#### Mach-O
+### Mach-O
 
 Resource is added as section in a new segment, load commands are updated and
 offsets are adjusted. `__LINKEDIT` is kept at the end of the file.
@@ -84,12 +86,12 @@ Sealed Resources=none
 Internal requirements=none
 ```
 
-#### PE
+### PE
 
 Resource is added into a new PE resource directory as `RT_RCDATA` type and
 extracted using `FindResource` and `LoadResource` at run-time.
 
-#### ELF
+### ELF
 
 Data is simply appended to the end of the file and extracted from
 `current_exe()` at run-time.
@@ -97,6 +99,15 @@ Data is simply appended to the end of the file and extracted from
 This is subject to change and may use ELF linker notes (`PT_NOTE`) in the
 future.
 
-### License
+## Testing
+
+This crate is fuzzed with LLVM's libFuzzer. See [fuzz/](fuzz/).
+
+`exec_*` executables in `tests/` are compiled from `tests/exec.rs`:
+```
+rustc exec.rs -o exec_elf64 --target x86_64-unknown-linux-gnu
+```
+
+## License
 
 MIT
