@@ -596,18 +596,35 @@ pub struct Elf<'a> {
     data: &'a [u8],
 }
 
+// Unsecure, makeshift hash function
+fn hash(name: &str) -> u32 {
+    let mut hash: u32 = 0;
+    for c in name.bytes() {
+        hash = hash.wrapping_add(c as u32);
+    }
+    hash
+}
+
 impl<'a> Elf<'a> {
     pub fn new(data: &'a [u8]) -> Self {
         Self { data }
     }
 
-    pub fn append<W: Write>(&self, sectdata: &[u8], writer: &mut W) -> Result<(), Error> {
+    pub fn append<W: Write>(
+        &self,
+        name: &str,
+        sectdata: &[u8],
+        writer: &mut W,
+    ) -> Result<(), Error> {
         let mut elf = self.data.to_vec();
         elf.extend_from_slice(sectdata);
+
+        // hash the name to 4 bytes int
         const MAGIC: u32 = 0x501e;
 
         elf.extend_from_slice(&MAGIC.to_le_bytes());
-        elf.extend_from_slice(&(sectdata.len() as u32 + 8).to_le_bytes());
+        elf.extend_from_slice(&hash(name).to_le_bytes());
+        elf.extend_from_slice(&(sectdata.len() as u32 + 12).to_le_bytes());
 
         writer.write_all(&elf)?;
         Ok(())
@@ -620,19 +637,25 @@ mod elf {
     use std::io::Seek;
     use std::io::SeekFrom;
 
-    pub fn find_section(_: &str) -> Option<&[u8]> {
+    pub fn find_section(name: &str) -> Option<&[u8]> {
         let exe = std::env::current_exe().unwrap();
 
         let mut file = std::fs::File::open(exe).unwrap();
-        file.seek(SeekFrom::End(-8)).unwrap();
-        let mut buf = [0; 8];
+        file.seek(SeekFrom::End(-12)).unwrap();
+        let mut buf = [0; 12];
         file.read_exact(&mut buf).unwrap();
         let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         if magic != 0x501e {
             return None;
         }
 
-        let offset = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+        let hash = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let name_hash = super::hash(name);
+        if hash != name_hash {
+            return None;
+        }
+
+        let offset = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]) as u64;
 
         file.seek(SeekFrom::End(-(offset as i64))).unwrap();
 
@@ -640,7 +663,7 @@ mod elf {
         let mut buf = Vec::new();
         file.read_to_end(&mut buf).unwrap();
 
-        let data = buf[..buf.len() - 8].to_vec();
+        let data = buf[..buf.len() - 12].to_vec();
 
         Some(Box::leak(data.into_boxed_slice()))
     }

@@ -130,7 +130,7 @@ fn test_elf(size: usize) {
         .open(&_path)
         .unwrap();
 
-    elf.append(&data, &mut out).unwrap();
+    elf.append(RESOURCE_NAME, &data, &mut out).unwrap();
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {

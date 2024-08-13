@@ -34,7 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .write_section("__SUI", data)?
             .build_and_sign(&mut out)?;
     } else if utils::is_elf(&exe) {
-        Elf::new(&exe).append(&data, &mut out)?;
+        Elf::new(&exe).append("__SUI", &data, &mut out)?;
     } else {
         eprintln!("Unsupported file format");
         std::process::exit(1);
