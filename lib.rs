@@ -46,8 +46,9 @@
 
 use core::mem::size_of;
 use editpe::{
-    constants::{LANGUAGE_ID_EN_US, RT_RCDATA},
-    ResourceEntry, ResourceEntryName, ResourceTable,
+    constants::{CODE_PAGE_ID_EN_US, RT_GROUP_ICON, RT_ICON, RT_RCDATA},
+    types::{IconDirectory, IconDirectoryEntry},
+    ResourceData, ResourceEntry, ResourceEntryName, ResourceTable,
 };
 use std::io::Write;
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
@@ -92,6 +93,8 @@ impl std::error::Error for Error {}
 /// a resource in the .rsrc section.
 pub struct PortableExecutable<'a> {
     image: editpe::Image<'a>,
+    resource_dir: editpe::ResourceDirectory,
+    icons: Vec<IconDirectoryEntry>,
 }
 
 impl<'a> PortableExecutable<'a> {
@@ -100,13 +103,14 @@ impl<'a> PortableExecutable<'a> {
         Ok(Self {
             image: editpe::Image::parse(data)
                 .map_err(|_| Error::InvalidObject("Failed to parse PE"))?,
+            resource_dir: editpe::ResourceDirectory::default(),
+            icons: Vec::new(),
         })
     }
 
     /// Write a resource to the PE file
     pub fn write_resource(mut self, name: &str, sectdata: Vec<u8>) -> Result<Self, Error> {
-        let mut resources = editpe::ResourceDirectory::default();
-        let root = resources.root_mut();
+        let root = self.resource_dir.root_mut();
         if root.get(ResourceEntryName::ID(RT_RCDATA as u32)).is_none() {
             root.insert(
                 ResourceEntryName::ID(RT_RCDATA as u32),
@@ -140,19 +144,121 @@ impl<'a> PortableExecutable<'a> {
         let mut entry = editpe::ResourceData::default();
         entry.set_data(sectdata);
 
-        rc_table.insert(
-            ResourceEntryName::ID(LANGUAGE_ID_EN_US as u32),
-            ResourceEntry::Data(entry),
-        );
+        rc_table.insert(ResourceEntryName::ID(0), ResourceEntry::Data(entry));
 
-        self.image
-            .set_resource_directory(resources)
-            .map_err(|_| Error::InternalError)?;
+        Ok(self)
+    }
+
+    /// Set the icon of the executable.
+    pub fn set_icon<T: AsRef<[u8]>>(mut self, icon: T) -> Result<Self, Error> {
+        let root = self.resource_dir.root_mut();
+        let icon = icon.as_ref();
+
+        // find the main icon table
+        if root.get(ResourceEntryName::ID(RT_ICON as u32)).is_none() {
+            root.insert(
+                ResourceEntryName::ID(RT_ICON as u32),
+                ResourceEntry::Table(ResourceTable::default()),
+            );
+        }
+        let icon_table = match root.get_mut(ResourceEntryName::ID(RT_ICON as u32)).unwrap() {
+            ResourceEntry::Table(table) => table,
+            ResourceEntry::Data(_) => {
+                return Err(Error::InvalidObject("icon table is not a table"));
+            }
+        };
+
+        // find the first free icon id
+        let first_free_icon_id = icon_table
+            .entries()
+            .into_iter()
+            .filter_map(|k| match k {
+                ResourceEntryName::ID(id) => Some(id),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(&0)
+            + 1;
+
+        // add the icon to the icon table
+        let mut icon_directory_entries = Vec::new();
+
+        let id = first_free_icon_id;
+        let mut inner_table = ResourceTable::default();
+        let data = {
+            let mut entry = IconDirectoryEntry::read_from_prefix(&icon[6..20]).unwrap();
+            entry.id = id as u16;
+            icon_directory_entries.push(entry);
+            icon[22..].to_owned()
+        };
+
+        let mut resource_data = ResourceData::default();
+        resource_data.set_codepage(CODE_PAGE_ID_EN_US as u32);
+        resource_data.set_data(data);
+
+        inner_table.insert(ResourceEntryName::ID(0), ResourceEntry::Data(resource_data));
+        icon_table.insert(ResourceEntryName::ID(id), ResourceEntry::Table(inner_table));
+        self.icons = icon_directory_entries;
+
         Ok(self)
     }
 
     /// Build and write the modified PE file
-    pub fn build<W: std::io::Write>(&self, writer: &mut W) -> Result<(), Error> {
+    pub fn build<W: std::io::Write>(mut self, writer: &mut W) -> Result<(), Error> {
+        // TODO: the order of the table entries matters. this works for now.
+        if !self.icons.is_empty() {
+            let root = self.resource_dir.root_mut();
+
+            // find the group icon table
+            if root
+                .get(ResourceEntryName::ID(RT_GROUP_ICON as u32))
+                .is_none()
+            {
+                root.insert(
+                    ResourceEntryName::ID(RT_GROUP_ICON as u32),
+                    ResourceEntry::Table(ResourceTable::default()),
+                );
+            }
+            let group_table = match root
+                .get_mut(ResourceEntryName::ID(RT_GROUP_ICON as u32))
+                .unwrap()
+            {
+                ResourceEntry::Table(table) => table,
+                ResourceEntry::Data(_) => {
+                    return Err(Error::InvalidObject("group icon table is not a table"));
+                }
+            };
+
+            let data = {
+                let mut data = Vec::new();
+                let icon_directory = IconDirectory {
+                    reserved: 0,
+                    type_: 1,
+                    count: self.icons.len() as u16,
+                };
+                data.extend(icon_directory.as_bytes());
+                for entry in self.icons {
+                    data.extend(&entry.as_bytes()[..14]);
+                }
+                data
+            };
+            let mut resource_data = ResourceData::default();
+            resource_data.set_codepage(CODE_PAGE_ID_EN_US as u32);
+            resource_data.set_data(data);
+            // insert the main icon directory table
+            let mut inner_table = ResourceTable::default();
+            inner_table.insert(ResourceEntryName::ID(0), ResourceEntry::Data(resource_data));
+            group_table.insert_at(
+                ResourceEntryName::from_string("MAINICON"),
+                ResourceEntry::Table(inner_table),
+                0,
+            );
+        }
+
+        self.image
+            .set_resource_directory(self.resource_dir)
+            .map_err(|_| Error::InternalError)?;
+
         let data = self.image.data();
         writer.write_all(data)?;
         Ok(())
