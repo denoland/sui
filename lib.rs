@@ -92,6 +92,7 @@ impl std::error::Error for Error {}
 /// a resource in the .rsrc section.
 pub struct PortableExecutable<'a> {
     image: editpe::Image<'a>,
+    resource_dir: editpe::ResourceDirectory,
 }
 
 impl<'a> PortableExecutable<'a> {
@@ -100,13 +101,13 @@ impl<'a> PortableExecutable<'a> {
         Ok(Self {
             image: editpe::Image::parse(data)
                 .map_err(|_| Error::InvalidObject("Failed to parse PE"))?,
+            resource_dir: editpe::ResourceDirectory::default(),
         })
     }
 
     /// Write a resource to the PE file
     pub fn write_resource(mut self, name: &str, sectdata: Vec<u8>) -> Result<Self, Error> {
-        let mut resources = editpe::ResourceDirectory::default();
-        let root = resources.root_mut();
+        let root = self.resource_dir.root_mut();
         if root.get(ResourceEntryName::ID(RT_RCDATA as u32)).is_none() {
             root.insert(
                 ResourceEntryName::ID(RT_RCDATA as u32),
@@ -145,14 +146,23 @@ impl<'a> PortableExecutable<'a> {
             ResourceEntry::Data(entry),
         );
 
-        self.image
-            .set_resource_directory(resources)
+        Ok(self)
+    }
+
+    /// Set the icon of the executable.
+    pub fn set_icon<T: AsRef<[u8]>>(mut self, icon: T) -> Result<Self, Error> {
+        self.resource_dir
+            .set_icon(icon)
             .map_err(|_| Error::InternalError)?;
         Ok(self)
     }
 
     /// Build and write the modified PE file
-    pub fn build<W: std::io::Write>(&self, writer: &mut W) -> Result<(), Error> {
+    pub fn build<W: std::io::Write>(mut self, writer: &mut W) -> Result<(), Error> {
+        self.image
+            .set_resource_directory(self.resource_dir)
+            .map_err(|_| Error::InternalError)?;
+
         let data = self.image.data();
         writer.write_all(data)?;
         Ok(())
