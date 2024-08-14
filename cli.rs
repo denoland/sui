@@ -5,6 +5,7 @@ use libsui::PortableExecutable;
 
 use libsui::utils;
 
+static TEST_ICO: &[u8] = include_bytes!("./tests/test.ico");
 const HELP: &str = r#"Usage: sui <exe> <data_file> <output>"#;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -27,6 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if utils::is_pe(&exe) {
         PortableExecutable::from(&exe)?
+            .set_icon(TEST_ICO)?
             .write_resource("__SUI", data)?
             .build(&mut out)?;
     } else if utils::is_macho(&exe) {
