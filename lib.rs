@@ -183,13 +183,13 @@ impl<'a> PortableExecutable<'a> {
         // add the icon to the icon table
         let mut icon_directory_entries = Vec::new();
 
-        let id = first_free_icon_id as u32;
+        let id = first_free_icon_id;
         let mut inner_table = ResourceTable::default();
         let data = {
             let mut entry = IconDirectoryEntry::read_from_prefix(&icon[6..20]).unwrap();
             entry.id = id as u16;
             icon_directory_entries.push(entry);
-            icon[22..].to_owned().into()
+            icon[22..].to_owned()
         };
 
         let mut resource_data = ResourceData::default();
@@ -240,7 +240,7 @@ impl<'a> PortableExecutable<'a> {
                 for entry in self.icons {
                     data.extend(&entry.as_bytes()[..14]);
                 }
-                data.into()
+                data
             };
             let mut resource_data = ResourceData::default();
             resource_data.set_codepage(CODE_PAGE_ID_EN_US as u32);
