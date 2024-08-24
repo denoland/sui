@@ -55,13 +55,6 @@ use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 pub mod apple_codesign;
 
-#[cfg(target_os = "linux")]
-pub use elf::find_section;
-#[cfg(target_os = "macos")]
-pub use macho::find_section;
-#[cfg(target_os = "windows")]
-pub use pe::find_section;
-
 #[derive(Debug)]
 pub enum Error {
     InvalidObject(&'static str),
@@ -623,6 +616,32 @@ impl Macho {
                     writer.write_all(self.linkedit_cmd.as_bytes())?;
                     continue;
                 }
+
+                const INTERNAL_SECTION: [u8; 16] = *b"__SUI_INTERNAL\0\0";
+                if segcmd.segname[..INTERNAL_SECTION.len()] == INTERNAL_SECTION {
+                    let offset = *offset + size_of::<SegmentCommand64>();
+                    let sect = Section64::read_from_prefix(&self.data[offset..])
+                        .ok_or(Error::InvalidObject("Failed to read section"))?;
+                    if sect.sectname == self.sec.sectname {
+                        // Find the offset of the __SUI_INTERNAL,__START data
+                        let start_offset = segcmd.fileoff as usize;
+                        let start_addr = self.seg.vmaddr;
+
+                        let orig = u64::from_le_bytes(
+                            self.data[start_offset..start_offset + 8]
+                                .try_into()
+                                .unwrap(),
+                        );
+                        println!("Original start address: 0x{:x}", orig);
+                        println!("New start address: 0x{:x}", start_addr);
+                        // Update the data at the offset
+                        self.data[start_offset..start_offset + 8]
+                            .copy_from_slice(&start_addr.to_le_bytes());
+                        // Length of the data
+                        self.data[start_offset + 8..start_offset + 16]
+                            .copy_from_slice(&(self.sec.size as u64).to_le_bytes());
+                    }
+                }
             }
             writer.write_all(&self.data[*offset..*offset + *cmdsize as usize])?;
         }
@@ -659,8 +678,30 @@ impl Macho {
     }
 }
 
+#[macro_export]
+macro_rules! get_section {
+    ($name:expr) => {{
+        #[cfg(target_os = "linux")]
+        {
+            $crate::elf::find_section($name)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            #[link_section = concat!("__SUI_INTERNAL,", $name)]
+            #[used]
+            static mut SECT_INFO: [usize; 2] = [0, 0];
+
+            $crate::macho::find_section($name, unsafe { &mut SECT_INFO })
+        }
+        #[cfg(target_os = "windows")]
+        {
+            $crate::pe::find_section($name)
+        }
+    }};
+}
+
 #[cfg(target_os = "macos")]
-mod macho {
+pub mod macho {
     use super::SEGNAME;
     use std::ffi::CString;
     use std::os::raw::c_char;
@@ -675,24 +716,35 @@ mod macho {
         pub fn _dyld_get_image_vmaddr_slide(image_index: usize) -> usize;
     }
 
-    pub fn find_section(section_name: &str) -> Option<&[u8]> {
-        let mut section_size: usize = 0;
-        let section_name = CString::new(section_name).ok()?;
-
+    pub fn find_section(section_name: &str, info: &mut [usize; 2]) -> Option<&'static [u8]> {
         unsafe {
+            let vmaddr_slide = _dyld_get_image_vmaddr_slide(0);
+            if info[0] != 0 {
+                println!("Fast path");
+                // Add the "virtual memory address slide" amount to ensure a valid pointer
+                // in cases where the virtual memory address have been adjusted by the OS.
+                return Some(std::slice::from_raw_parts(
+                    (info[0] + vmaddr_slide) as *const u8,
+                    info[1],
+                ));
+            }
+
+            let mut section_size: usize = 0;
+            let section_name = CString::new(section_name).ok()?;
+
             let mut ptr = getsectdata(
                 SEGNAME.as_ptr() as *const c_char,
                 section_name.as_ptr() as *const c_char,
                 &mut section_size as *mut usize,
             );
 
-            if ptr.is_null() {
+            if ptr.is_null() || section_size == 0 {
                 return None;
             }
 
             // Add the "virtual memory address slide" amount to ensure a valid pointer
             // in cases where the virtual memory address have been adjusted by the OS.
-            ptr = ptr.wrapping_add(_dyld_get_image_vmaddr_slide(0));
+            ptr = ptr.wrapping_add(vmaddr_slide);
             Some(std::slice::from_raw_parts(ptr as *const u8, section_size))
         }
     }

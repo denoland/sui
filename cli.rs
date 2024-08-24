@@ -1,4 +1,4 @@
-use libsui::find_section;
+use libsui::get_section;
 use libsui::Elf;
 use libsui::Macho;
 use libsui::PortableExecutable;
@@ -9,9 +9,8 @@ static TEST_ICO: &[u8] = include_bytes!("./tests/test.ico");
 const HELP: &str = r#"Usage: sui <exe> <data_file> <output>"#;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(section) = find_section("__SUI") {
+    if let Some(section) = get_section!("__SUI") {
         println!("Found section");
-        println!("{}", std::str::from_utf8(section)?);
         return Ok(());
     }
 
