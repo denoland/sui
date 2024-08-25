@@ -55,11 +55,11 @@ use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 pub mod apple_codesign;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(unix, not(target_vendor = "apple")))]
 pub use elf::find_section;
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 pub use macho::find_section;
-#[cfg(target_os = "windows")]
+#[cfg(windows)]
 pub use pe::find_section;
 
 #[derive(Debug)]
@@ -265,7 +265,7 @@ impl<'a> PortableExecutable<'a> {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(windows)]
 mod pe {
     use std::ffi::CString;
     use windows_sys::Win32::System::LibraryLoader::{
@@ -659,7 +659,7 @@ impl Macho {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_vendor = "apple")]
 mod macho {
     use super::SEGNAME;
     use std::ffi::CString;
@@ -737,7 +737,7 @@ impl<'a> Elf<'a> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(unix, not(target_vendor = "apple")))]
 mod elf {
     use std::io::Read;
     use std::io::Seek;
