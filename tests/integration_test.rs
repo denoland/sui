@@ -51,15 +51,15 @@ fn test_macho(size: usize, sign: bool) {
     let macho = Macho::from(input).unwrap();
     let _path = std::env::temp_dir().join("exec_mach64_out");
     // Remove the file if it exists
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     {
         let _ = std::fs::remove_file(&_path);
     }
 
     let data = vec![0; size];
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(target_vendor = "apple"))]
     let mut out = std::io::sink();
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     let mut out = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -73,7 +73,7 @@ fn test_macho(size: usize, sign: bool) {
         m.build(&mut out).unwrap();
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
     if sign {
         drop(out);
         // Run the output
@@ -120,9 +120,9 @@ fn test_elf(size: usize) {
     let _path = std::env::temp_dir().join("exec_elf64_out");
 
     let data = vec![0; size];
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(unix, not(target_vendor = "apple"))))]
     let mut out = std::io::sink();
-    #[cfg(target_os = "linux")]
+    #[cfg(all(unix, not(target_vendor = "apple")))]
     let mut out = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -132,7 +132,7 @@ fn test_elf(size: usize) {
 
     elf.append(RESOURCE_NAME, &data, &mut out).unwrap();
 
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(unix, not(target_vendor = "apple"), target_arch = "x86_64"))]
     {
         drop(out);
         // Run the output
@@ -159,9 +159,9 @@ fn test_pe(size: usize) {
     let _path = std::env::temp_dir().join("exec_pe64_out");
 
     let data = vec![0; size];
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(windows))]
     let mut out = std::io::sink();
-    #[cfg(target_os = "windows")]
+    #[cfg(windows)]
     let mut out = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -172,7 +172,7 @@ fn test_pe(size: usize) {
         .build(&mut out)
         .unwrap();
 
-    #[cfg(target_os = "windows")]
+    #[cfg(windows)]
     {
         drop(out);
         // Run the output
