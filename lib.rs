@@ -268,7 +268,7 @@ impl<'a> PortableExecutable<'a> {
 #[cfg(target_os = "windows")]
 mod pe {
     use std::ffi::CString;
-    use windows_sys::Win32::System::LibraryLoader::{
+    use windows::Win32::System::LibraryLoader::{
         FindResourceA, LoadResource, LockResource, SizeofResource,
     };
 

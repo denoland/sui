@@ -15,6 +15,9 @@ sha2 = "0.10"
 
 # object = { version = "0.36.1", features = ["build"] }
 
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58.0", features = ["Win32_System", "Win32_System_LibraryLoader", "Win32_Foundation"] }
+
 [lib]
 path = "lib.rs"
 
@@ -22,5 +25,4 @@ path = "lib.rs"
 name = "sui"
 path = "cli.rs"
 
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.48.0", features = ["Win32_System", "Win32_System_LibraryLoader", "Win32_Foundation"] }
+
