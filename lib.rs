@@ -744,9 +744,14 @@ mod elf {
     use std::io::SeekFrom;
 
     pub fn find_section(name: &str) -> Option<&[u8]> {
-        let exe = std::env::current_exe().unwrap();
+        let Ok(exe) = std::env::current_exe() else {
+            return None;
+        };
 
-        let mut file = std::fs::File::open(exe).unwrap();
+        let Ok(mut file) = std::fs::File::open(exe) else {
+            return None;
+        };
+
         file.seek(SeekFrom::End(-12)).unwrap();
         let mut buf = [0; 12];
         file.read_exact(&mut buf).unwrap();
