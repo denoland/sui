@@ -126,6 +126,7 @@ fn test_elf(size: usize) {
     let mut out = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
+        .truncate(true)
         .mode(0o755)
         .open(&_path)
         .unwrap();
