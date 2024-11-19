@@ -13,7 +13,7 @@ extract existing section: sui <sectionname>
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    let sectionname = if args.len() < 1 {
+    let sectionname = if args.is_empty() {
         eprintln!("{}", HELP);
         std::process::exit(1);
     } else {
