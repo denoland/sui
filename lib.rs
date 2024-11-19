@@ -727,10 +727,11 @@ impl<'a> Elf<'a> {
 
         // hash the name to 4 bytes int
         const MAGIC: u32 = 0x501e;
+        const TRAILER_LEN: u64 = 8 + 4 + 4;
 
         elf.extend_from_slice(&MAGIC.to_le_bytes());
         elf.extend_from_slice(&hash(name).to_le_bytes());
-        elf.extend_from_slice(&(sectdata.len() as u32 + 12).to_le_bytes());
+        elf.extend_from_slice(&(sectdata.len() as u64 + TRAILER_LEN).to_le_bytes());
 
         writer.write_all(&elf)?;
         Ok(())
@@ -752,8 +753,9 @@ mod elf {
             return None;
         };
 
-        file.seek(SeekFrom::End(-12)).unwrap();
-        let mut buf = [0; 12];
+        const TRAILER_LEN: i64 = 8 + 4 + 4;
+        file.seek(SeekFrom::End(-TRAILER_LEN)).unwrap();
+        let mut buf = [0; TRAILER_LEN as usize];
         file.read_exact(&mut buf).unwrap();
         let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         if magic != 0x501e {
@@ -766,15 +768,15 @@ mod elf {
             return None;
         }
 
-        let offset = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]) as u64;
+        let offset = u64::from_le_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]) as i64;
 
-        file.seek(SeekFrom::End(-(offset as i64))).unwrap();
+        file.seek(SeekFrom::End(-offset)).unwrap();
 
         // Read section data
         let mut buf = Vec::new();
         file.read_to_end(&mut buf).unwrap();
 
-        let data = buf[..buf.len() - 12].to_vec();
+        let data = buf[..buf.len() - TRAILER_LEN as usize].to_vec();
 
         Some(Box::leak(data.into_boxed_slice()))
     }
