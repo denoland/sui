@@ -642,7 +642,7 @@ impl Macho {
             }
         }
 
-        writer.write_all(&self.data[off..off + self.linkedit_cmd.filesize as usize])?;
+        writer.write_all(&self.data[off..])?;
 
         Ok(())
     }
