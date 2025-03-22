@@ -46,7 +46,7 @@
 
 use core::mem::size_of;
 use editpe::{
-    constants::{CODE_PAGE_ID_EN_US, RT_GROUP_ICON, RT_ICON, RT_RCDATA},
+    constants::{CODE_PAGE_ID_EN_US, RT_GROUP_ICON, RT_RCDATA},
     types::{IconDirectory, IconDirectoryEntry},
     ResourceData, ResourceEntry, ResourceEntryName, ResourceTable,
 };
@@ -151,55 +151,9 @@ impl<'a> PortableExecutable<'a> {
 
     /// Set the icon of the executable.
     pub fn set_icon<T: AsRef<[u8]>>(mut self, icon: T) -> Result<Self, Error> {
-        let root = self.resource_dir.root_mut();
-        let icon = icon.as_ref();
-
-        // find the main icon table
-        if root.get(ResourceEntryName::ID(RT_ICON as u32)).is_none() {
-            root.insert(
-                ResourceEntryName::ID(RT_ICON as u32),
-                ResourceEntry::Table(ResourceTable::default()),
-            );
-        }
-        let icon_table = match root.get_mut(ResourceEntryName::ID(RT_ICON as u32)).unwrap() {
-            ResourceEntry::Table(table) => table,
-            ResourceEntry::Data(_) => {
-                return Err(Error::InvalidObject("icon table is not a table"));
-            }
-        };
-
-        // find the first free icon id
-        let first_free_icon_id = icon_table
-            .entries()
-            .into_iter()
-            .filter_map(|k| match k {
-                ResourceEntryName::ID(id) => Some(id),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(&0)
-            + 1;
-
-        // add the icon to the icon table
-        let mut icon_directory_entries = Vec::new();
-
-        let id = first_free_icon_id;
-        let mut inner_table = ResourceTable::default();
-        let data = {
-            let mut entry = IconDirectoryEntry::read_from_prefix(&icon[6..20]).unwrap();
-            entry.id = id as u16;
-            icon_directory_entries.push(entry);
-            icon[22..].to_owned()
-        };
-
-        let mut resource_data = ResourceData::default();
-        resource_data.set_codepage(CODE_PAGE_ID_EN_US as u32);
-        resource_data.set_data(data);
-
-        inner_table.insert(ResourceEntryName::ID(0), ResourceEntry::Data(resource_data));
-        icon_table.insert(ResourceEntryName::ID(id), ResourceEntry::Table(inner_table));
-        self.icons = icon_directory_entries;
-
+        self.resource_dir
+            .set_icon(icon)
+            .map_err(|_| Error::InternalError)?;
         Ok(self)
     }
 
@@ -768,7 +722,9 @@ mod elf {
             return None;
         }
 
-        let offset = u64::from_le_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]) as i64;
+        let offset = u64::from_le_bytes([
+            buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+        ]) as i64;
 
         file.seek(SeekFrom::End(-offset)).unwrap();
 

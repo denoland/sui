@@ -9,7 +9,7 @@ repository = "https://github.com/denoland/sui"
 
 [dependencies]
 libc = "0.2"
-editpe = { version = "0.1.0", default-features = false }
+editpe = { version = "0.1.0", default-features = false, features = ["image"] }
 zerocopy = { version = "0.7", features = ["derive"] }
 sha2 = "0.10"
 
