@@ -146,13 +146,16 @@ impl<'a> PortableExecutable<'a> {
 
         rc_table.insert(ResourceEntryName::ID(0), ResourceEntry::Data(entry));
 
+        self.image
+            .set_resource_directory(self.resource_dir.clone())
+            .map_err(|_| Error::InternalError)?;
         Ok(self)
     }
 
     /// Set the icon of the executable.
     pub fn set_icon<T: AsRef<[u8]>>(mut self, icon: T) -> Result<Self, Error> {
         self.resource_dir
-            .set_icon(icon)
+            .set_main_icon(icon.as_ref())
             .map_err(|_| Error::InternalError)?;
         Ok(self)
     }
@@ -160,58 +163,54 @@ impl<'a> PortableExecutable<'a> {
     /// Build and write the modified PE file
     pub fn build<W: std::io::Write>(mut self, writer: &mut W) -> Result<(), Error> {
         // TODO: the order of the table entries matters. this works for now.
-        if !self.icons.is_empty() {
-            let root = self.resource_dir.root_mut();
+        // if !self.icons.is_empty() {
+        //     let root = self.resource_dir.root_mut();
 
-            // find the group icon table
-            if root
-                .get(ResourceEntryName::ID(RT_GROUP_ICON as u32))
-                .is_none()
-            {
-                root.insert(
-                    ResourceEntryName::ID(RT_GROUP_ICON as u32),
-                    ResourceEntry::Table(ResourceTable::default()),
-                );
-            }
-            let group_table = match root
-                .get_mut(ResourceEntryName::ID(RT_GROUP_ICON as u32))
-                .unwrap()
-            {
-                ResourceEntry::Table(table) => table,
-                ResourceEntry::Data(_) => {
-                    return Err(Error::InvalidObject("group icon table is not a table"));
-                }
-            };
+        //     // find the group icon table
+        //     if root
+        //         .get(ResourceEntryName::ID(RT_GROUP_ICON as u32))
+        //         .is_none()
+        //     {
+        //         root.insert(
+        //             ResourceEntryName::ID(RT_GROUP_ICON as u32),
+        //             ResourceEntry::Table(ResourceTable::default()),
+        //         );
+        //     }
+        //     let group_table = match root
+        //         .get_mut(ResourceEntryName::ID(RT_GROUP_ICON as u32))
+        //         .unwrap()
+        //     {
+        //         ResourceEntry::Table(table) => table,
+        //         ResourceEntry::Data(_) => {
+        //             return Err(Error::InvalidObject("group icon table is not a table"));
+        //         }
+        //     };
 
-            let data = {
-                let mut data = Vec::new();
-                let icon_directory = IconDirectory {
-                    reserved: 0,
-                    type_: 1,
-                    count: self.icons.len() as u16,
-                };
-                data.extend(icon_directory.as_bytes());
-                for entry in self.icons {
-                    data.extend(&entry.as_bytes()[..14]);
-                }
-                data
-            };
-            let mut resource_data = ResourceData::default();
-            resource_data.set_codepage(CODE_PAGE_ID_EN_US as u32);
-            resource_data.set_data(data);
-            // insert the main icon directory table
-            let mut inner_table = ResourceTable::default();
-            inner_table.insert(ResourceEntryName::ID(0), ResourceEntry::Data(resource_data));
-            group_table.insert_at(
-                ResourceEntryName::from_string("MAINICON"),
-                ResourceEntry::Table(inner_table),
-                0,
-            );
-        }
-
-        self.image
-            .set_resource_directory(self.resource_dir)
-            .map_err(|_| Error::InternalError)?;
+        //     let data = {
+        //         let mut data = Vec::new();
+        //         let icon_directory = IconDirectory {
+        //             reserved: 0,
+        //             type_: 1,
+        //             count: self.icons.len() as u16,
+        //         };
+        //         data.extend(icon_directory.as_bytes());
+        //         for entry in self.icons {
+        //             data.extend(&entry.as_bytes()[..14]);
+        //         }
+        //         data
+        //     };
+        //     let mut resource_data = ResourceData::default();
+        //     resource_data.set_codepage(CODE_PAGE_ID_EN_US as u32);
+        //     resource_data.set_data(data);
+        //     // insert the main icon directory table
+        //     let mut inner_table = ResourceTable::default();
+        //     inner_table.insert(ResourceEntryName::ID(0), ResourceEntry::Data(resource_data));
+        //     group_table.insert_at(
+        //         ResourceEntryName::from_string("MAINICON"),
+        //         ResourceEntry::Table(inner_table),
+        //         0,
+        //     );
+        // }
 
         let data = self.image.data();
         writer.write_all(data)?;
