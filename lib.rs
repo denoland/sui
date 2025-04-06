@@ -50,6 +50,8 @@ use editpe::{
     types::{IconDirectory, IconDirectoryEntry},
     ResourceData, ResourceEntry, ResourceEntryName, ResourceTable,
 };
+use image::{imageops::FilterType::Lanczos3, ImageFormat, ImageReader};
+use std::io::Cursor;
 use std::io::Write;
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
@@ -65,6 +67,7 @@ pub use pe::find_section;
 #[derive(Debug)]
 pub enum Error {
     InvalidObject(&'static str),
+    ImageError(image::ImageError),
     InternalError,
     IoError(std::io::Error),
 }
@@ -74,8 +77,15 @@ impl std::fmt::Display for Error {
         match self {
             Error::InvalidObject(msg) => write!(f, "Invalid object: {}", msg),
             Error::InternalError => write!(f, "Internal error"),
+            Error::ImageError(err) => write!(f, "Image error: {}", err),
             Error::IoError(err) => write!(f, "I/O error: {}", err),
         }
+    }
+}
+
+impl From<image::ImageError> for Error {
+    fn from(err: image::ImageError) -> Self {
+        Error::ImageError(err)
     }
 }
 
@@ -153,6 +163,9 @@ impl<'a> PortableExecutable<'a> {
     pub fn set_icon<T: AsRef<[u8]>>(mut self, icon: T) -> Result<Self, Error> {
         let root = self.resource_dir.root_mut();
         let icon = icon.as_ref();
+        let icon = ImageReader::new(Cursor::new(icon))
+            .with_guessed_format()?
+            .decode()?;
 
         // find the main icon table
         if root.get(ResourceEntryName::ID(RT_ICON as u32)).is_none() {
@@ -182,22 +195,29 @@ impl<'a> PortableExecutable<'a> {
 
         // add the icon to the icon table
         let mut icon_directory_entries = Vec::new();
+        let resolutions = [256, 128, 48, 32, 24, 16];
+        for (i, &size) in resolutions.iter().enumerate() {
+            let id = first_free_icon_id + i as u32;
+            let mut inner_table = ResourceTable::default();
+            let data = {
+                let mut data = Vec::new();
+                icon.resize_exact(size, size, Lanczos3)
+                    .to_rgba8()
+                    .write_to(&mut Cursor::new(&mut data), ImageFormat::Ico)?;
 
-        let id = first_free_icon_id;
-        let mut inner_table = ResourceTable::default();
-        let data = {
-            let mut entry = IconDirectoryEntry::read_from_prefix(&icon[6..20]).unwrap();
-            entry.id = id as u16;
-            icon_directory_entries.push(entry);
-            icon[22..].to_owned()
-        };
+                let mut entry = IconDirectoryEntry::read_from_prefix(&data[6..20]).unwrap();
+                entry.id = id as u16;
+                icon_directory_entries.push(entry);
+                data[22..].to_owned()
+            };
 
-        let mut resource_data = ResourceData::default();
-        resource_data.set_codepage(CODE_PAGE_ID_EN_US as u32);
-        resource_data.set_data(data);
+            let mut resource_data = ResourceData::default();
+            resource_data.set_codepage(CODE_PAGE_ID_EN_US as u32);
+            resource_data.set_data(data);
 
-        inner_table.insert(ResourceEntryName::ID(0), ResourceEntry::Data(resource_data));
-        icon_table.insert(ResourceEntryName::ID(id), ResourceEntry::Table(inner_table));
+            inner_table.insert(ResourceEntryName::ID(0), ResourceEntry::Data(resource_data));
+            icon_table.insert(ResourceEntryName::ID(id), ResourceEntry::Table(inner_table));
+        }
         self.icons = icon_directory_entries;
 
         Ok(self)
