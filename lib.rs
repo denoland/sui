@@ -768,7 +768,9 @@ mod elf {
             return None;
         }
 
-        let offset = u64::from_le_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]) as i64;
+        let offset = u64::from_le_bytes([
+            buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+        ]) as i64;
 
         file.seek(SeekFrom::End(-offset)).unwrap();
 

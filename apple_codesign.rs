@@ -165,7 +165,7 @@ impl MachoSigner {
         const PAGE_SIZE: usize = 1 << 12;
 
         let id = b"a.out\0";
-        let n_hashes = (self.sig_off + PAGE_SIZE - 1) / PAGE_SIZE;
+        let n_hashes = self.sig_off.div_ceil(PAGE_SIZE);
         let id_off = size_of::<CodeDirectory>();
         let hash_off = id_off + id.len();
         let c_dir_sz = hash_off + n_hashes * 32;
