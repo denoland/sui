@@ -19,7 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         &args[1]
     };
-    if let Some(section) = find_section(sectionname) {
+    if let Some(section) = find_section(sectionname)? {
         println!("Found section");
         println!("{}", std::str::from_utf8(section)?);
         return Ok(());

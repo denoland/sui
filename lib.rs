@@ -292,32 +292,36 @@ mod pe {
         FindResourceA, LoadResource, LockResource, SizeofResource,
     };
 
-    pub fn find_section(section_name: &str) -> Option<&[u8]> {
-        let Ok(section_name) = CString::new(section_name) else {
-            return None;
-        };
+    pub fn find_section(section_name: &str) -> std::io::Result<Option<&[u8]>> {
+        let section_name = CString::new(section_name)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
 
         unsafe {
-            let resource_handle = FindResourceA(0, section_name.as_ptr() as _, 10 as *const _);
+            let current_process_hmod = 0;
+            let resource_handle = FindResourceA(
+                current_process_hmod,
+                section_name.as_ptr() as _,
+                10 as *const _,
+            );
             if resource_handle == 0 {
-                return None;
+                return Ok(None);
             }
 
-            let resource_data = LoadResource(0, resource_handle);
+            let resource_data = LoadResource(current_process_hmod, resource_handle);
             if resource_data == 0 {
-                return None;
+                return Err(std::io::Error::last_os_error());
             }
 
-            let resource_size = SizeofResource(0, resource_handle);
+            let resource_size = SizeofResource(current_process_hmod, resource_handle);
             if resource_size == 0 {
-                return None;
+                return Err(std::io::Error::last_os_error());
             }
 
             let resource_ptr = LockResource(resource_data);
-            Some(std::slice::from_raw_parts(
+            Ok(Some(std::slice::from_raw_parts(
                 resource_ptr as *const u8,
                 resource_size as usize,
-            ))
+            )))
         }
     }
 }
@@ -695,9 +699,10 @@ mod macho {
         pub fn _dyld_get_image_vmaddr_slide(image_index: usize) -> usize;
     }
 
-    pub fn find_section(section_name: &str) -> Option<&[u8]> {
+    pub fn find_section(section_name: &str) -> std::io::Result<Option<&[u8]>> {
         let mut section_size: usize = 0;
-        let section_name = CString::new(section_name).ok()?;
+        let section_name = CString::new(section_name)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
 
         unsafe {
             let mut ptr = getsectdata(
@@ -707,13 +712,16 @@ mod macho {
             );
 
             if ptr.is_null() {
-                return None;
+                return Ok(None);
             }
 
             // Add the "virtual memory address slide" amount to ensure a valid pointer
             // in cases where the virtual memory address have been adjusted by the OS.
             ptr = ptr.wrapping_add(_dyld_get_image_vmaddr_slide(0));
-            Some(std::slice::from_raw_parts(ptr as *const u8, section_size))
+            Ok(Some(std::slice::from_raw_parts(
+                ptr as *const u8,
+                section_size,
+            )))
         }
     }
 }
@@ -764,43 +772,38 @@ mod elf {
     use std::io::Seek;
     use std::io::SeekFrom;
 
-    pub fn find_section(name: &str) -> Option<&[u8]> {
-        let Ok(exe) = std::env::current_exe() else {
-            return None;
-        };
-
-        let Ok(mut file) = std::fs::File::open(exe) else {
-            return None;
-        };
+    pub fn find_section(name: &str) -> std::io::Result<Option<&[u8]>> {
+        let exe = std::env::current_exe()?;
+        let mut file = std::fs::File::open(exe)?;
 
         const TRAILER_LEN: i64 = 8 + 4 + 4;
-        file.seek(SeekFrom::End(-TRAILER_LEN)).unwrap();
+        file.seek(SeekFrom::End(-TRAILER_LEN))?;
         let mut buf = [0; TRAILER_LEN as usize];
-        file.read_exact(&mut buf).unwrap();
+        file.read_exact(&mut buf)?;
         let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         if magic != 0x501e {
-            return None;
+            return Ok(None);
         }
 
         let hash = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
         let name_hash = super::hash(name);
         if hash != name_hash {
-            return None;
+            return Ok(None);
         }
 
         let offset = u64::from_le_bytes([
             buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
         ]) as i64;
 
-        file.seek(SeekFrom::End(-offset)).unwrap();
+        file.seek(SeekFrom::End(-offset))?;
 
         // Read section data
         let mut buf = Vec::new();
-        file.read_to_end(&mut buf).unwrap();
+        file.read_to_end(&mut buf)?;
 
         let data = buf[..buf.len() - TRAILER_LEN as usize].to_vec();
 
-        Some(Box::leak(data.into_boxed_slice()))
+        Ok(Some(Box::leak(data.into_boxed_slice())))
     }
 }
 
