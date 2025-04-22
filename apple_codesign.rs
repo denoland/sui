@@ -24,12 +24,12 @@
  */
 use sha2::{Digest, Sha256};
 use zerocopy::byteorder::big_endian;
-use zerocopy::{AsBytes, FromBytes, FromZeroes};
+use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
 use crate::{Error, Header64, SegmentCommand64, LC_CODE_SIGNATURE, LC_SEGMENT_64};
 use core::mem::size_of;
 
-#[derive(Debug, Clone, FromBytes, FromZeroes, AsBytes)]
+#[derive(Debug, Clone, FromBytes, IntoBytes, Immutable)]
 #[repr(C)]
 struct SuperBlob {
     magic: big_endian::U32,
@@ -37,7 +37,7 @@ struct SuperBlob {
     count: big_endian::U32,
 }
 
-#[derive(Debug, Clone, FromBytes, FromZeroes, AsBytes)]
+#[derive(Debug, Clone, FromBytes, IntoBytes, Immutable)]
 #[repr(C)]
 struct Blob {
     typ: big_endian::U32,
@@ -45,7 +45,7 @@ struct Blob {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, FromBytes, FromZeroes, AsBytes)]
+#[derive(Debug, Clone, FromBytes, IntoBytes, Immutable)]
 struct CodeDirectory {
     magic: big_endian::U32,           // magic number (CSMAGIC_CODEDIRECTORY)
     length: big_endian::U32,          // total length of CodeDirectory blob
@@ -70,7 +70,7 @@ struct CodeDirectory {
     exec_seg_flags: big_endian::U64,
 }
 
-#[derive(FromBytes, FromZeroes, AsBytes, Debug)]
+#[derive(FromBytes, IntoBytes, KnownLayout, Debug)]
 #[repr(C)]
 struct LinkeditDataCommand {
     cmd: u32,
@@ -101,8 +101,8 @@ const CS_EXECSEG_MAIN_BINARY: u64 = 0x1; // executable segment denotes main bina
 
 impl MachoSigner {
     pub fn new(obj: Vec<u8>) -> Result<Self, Error> {
-        let header = Header64::read_from_prefix(&obj)
-            .ok_or(Error::InvalidObject("Invalid Mach-O header"))?;
+        let (header, _body) = Header64::read_from_prefix(&obj)
+            .map_err(|_| Error::InvalidObject("Invalid Mach-O header"))?;
 
         let mut offset = size_of::<Header64>();
         let mut sig_off = 0;
@@ -126,15 +126,15 @@ impl MachoSigner {
             );
 
             if cmd == LC_CODE_SIGNATURE {
-                let cmd = LinkeditDataCommand::read_from_prefix(&obj[offset..])
-                    .ok_or(Error::InvalidObject("Failed to read linkedit data command"))?;
+                let (cmd, _body) = LinkeditDataCommand::read_from_prefix(&obj[offset..])
+                    .map_err(|_| Error::InvalidObject("Failed to read linkedit data command"))?;
                 sig_off = cmd.dataoff as usize;
                 sig_sz = cmd.datasize as usize;
                 cs_cmd_off = offset;
             }
             if cmd == LC_SEGMENT_64 {
-                let segcmd = SegmentCommand64::read_from_prefix(&obj[offset..])
-                    .ok_or(Error::InvalidObject("Failed to read segment command"))?;
+                let (segcmd, _body) = SegmentCommand64::read_from_prefix(&obj[offset..])
+                    .map_err(|_| Error::InvalidObject("Failed to read segment command"))?;
                 // Convert fixed size array terminated by null byte to string
                 let segname = String::from_utf8_lossy(&segcmd.segname);
                 let segname = segname.trim_end_matches('\0');
@@ -173,15 +173,15 @@ impl MachoSigner {
 
         if self.sig_sz != sz {
             // Update the load command
-            let cs_cmd = LinkeditDataCommand::mut_from_prefix(&mut self.data[self.cs_cmd_off..])
-                .ok_or(Error::InvalidObject("Failed to read linkedit data command"))?;
+            let (cs_cmd, _body) = LinkeditDataCommand::mut_from_prefix(&mut self.data[self.cs_cmd_off..])
+                .map_err(|_| Error::InvalidObject("Failed to read linkedit data command"))?;
             cs_cmd.datasize = sz as u32;
 
             // Update __LINKEDIT segment
             let seg_sz = self.sig_off + sz - self.linkedit_seg.fileoff as usize;
-            let linkedit_seg =
+            let (linkedit_seg, _body) =
                 SegmentCommand64::mut_from_prefix(&mut self.data[self.linkedit_off..])
-                    .ok_or(Error::InvalidObject("Failed to read linkedit segment"))?;
+                    .map_err(|_| Error::InvalidObject("Failed to read linkedit segment"))?;
             linkedit_seg.filesize = seg_sz as u64;
             linkedit_seg.vmsize = seg_sz as u64;
         }
