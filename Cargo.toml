@@ -10,8 +10,8 @@ repository = "https://github.com/denoland/sui"
 [dependencies]
 image = { version = "0.25", default-features = false, features = ["bmp", "ico", "png"] }
 libc = "0.2"
-editpe = { version = "0.1.0", default-features = false }
-zerocopy = { version = "0.7", features = ["derive"] }
+editpe = { version = "0.2.1", features = ["std"], default-features = false }
+zerocopy = { version = "0.8", features = ["derive"] }
 sha2 = "0.10"
 
 # object = { version = "0.36.1", features = ["build"] }
