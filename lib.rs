@@ -110,10 +110,12 @@ pub struct PortableExecutable<'a> {
 impl<'a> PortableExecutable<'a> {
     /// Parse from a PE file
     pub fn from(data: &'a [u8]) -> Result<Self, Error> {
+        let image = editpe::Image::parse(data)
+                .map_err(|_| Error::InvalidObject("Failed to parse PE"))?;
+        let resource_dir = image.resource_directory().cloned().unwrap_or_default();
         Ok(Self {
-            image: editpe::Image::parse(data)
-                .map_err(|_| Error::InvalidObject("Failed to parse PE"))?,
-            resource_dir: editpe::ResourceDirectory::default(),
+            image,
+            resource_dir,
             icons: Vec::new(),
         })
     }
