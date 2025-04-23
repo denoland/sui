@@ -53,7 +53,7 @@ use editpe::{
 use image::{imageops::FilterType::Lanczos3, ImageFormat, ImageReader};
 use std::io::Cursor;
 use std::io::Write;
-use zerocopy::{AsBytes, FromBytes, FromZeroes};
+use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
 pub mod apple_codesign;
 
@@ -205,7 +205,7 @@ impl<'a> PortableExecutable<'a> {
                     .to_rgba8()
                     .write_to(&mut Cursor::new(&mut data), ImageFormat::Ico)?;
 
-                let mut entry = IconDirectoryEntry::read_from_prefix(&data[6..20]).unwrap();
+                let (mut entry, _body) = IconDirectoryEntry::read_from_prefix(&data[6..20]).unwrap();
                 entry.id = id as u16;
                 icon_directory_entries.push(entry);
                 data[22..].to_owned()
@@ -328,7 +328,7 @@ mod pe {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, FromBytes, FromZeroes, AsBytes)]
+#[derive(Debug, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
 pub(crate) struct SegmentCommand64 {
     cmd: u32,
     cmdsize: u32,
@@ -343,7 +343,7 @@ pub(crate) struct SegmentCommand64 {
     flags: u32,
 }
 
-#[derive(FromBytes, FromZeroes, AsBytes)]
+#[derive(FromBytes, IntoBytes, Immutable)]
 #[repr(C)]
 pub(crate) struct Header64 {
     magic: u32,
@@ -357,7 +357,7 @@ pub(crate) struct Header64 {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, FromBytes, FromZeroes, AsBytes)]
+#[derive(Debug, Clone, FromBytes, IntoBytes, Immutable)]
 pub(crate) struct Section64 {
     sectname: [u8; 16],
     segname: [u8; 16],
@@ -425,8 +425,8 @@ pub(crate) const SEGNAME: [u8; 16] = *b"__SUI\0\0\0\0\0\0\0\0\0\0\0";
 
 impl Macho {
     pub fn from(obj: Vec<u8>) -> Result<Self, Error> {
-        let header = Header64::read_from_prefix(&obj)
-            .ok_or(Error::InvalidObject("Failed to read header"))?;
+        let (header, _body) = Header64::read_from_prefix(&obj)
+            .map_err(|_| Error::InvalidObject("Failed to read header"))?;
         let mut commands: Vec<(u32, u32, usize)> = Vec::with_capacity(header.ncmds as usize);
 
         let mut offset = size_of::<Header64>();
@@ -445,8 +445,8 @@ impl Macho {
             );
 
             if cmd == LC_SEGMENT_64 {
-                let segcmd = SegmentCommand64::read_from_prefix(&obj[offset..])
-                    .ok_or(Error::InvalidObject("Failed to read segment command"))?;
+                let (segcmd, _body) = SegmentCommand64::read_from_prefix(&obj[offset..])
+                    .map_err(|_| Error::InvalidObject("Failed to read segment command"))?;
                 if segcmd.segname[..SEG_LINKEDIT.len()] == *SEG_LINKEDIT {
                     linkedit_cmd = Some(segcmd);
                 }
@@ -525,7 +525,7 @@ impl Macho {
         for (cmd, _, offset) in self.commands.iter_mut() {
             match *cmd {
                 LC_SYMTAB => {
-                    #[derive(FromBytes, FromZeroes, AsBytes)]
+                    #[derive(IntoBytes, KnownLayout, FromBytes)]
                     #[repr(C)]
                     pub struct SymtabCommand {
                         pub cmd: u32,
@@ -536,13 +536,13 @@ impl Macho {
                         pub strsize: u32,
                     }
 
-                    let cmd = SymtabCommand::mut_from_prefix(&mut self.data[*offset..])
-                        .ok_or(Error::InvalidObject("Failed to read symtab command"))?;
+                    let (cmd, _body) = SymtabCommand::mut_from_prefix(&mut self.data[*offset..])
+                        .map_err(|_| Error::InvalidObject("Failed to read symtab command"))?;
                     shift_cmd!(cmd.symoff);
                     shift_cmd!(cmd.stroff);
                 }
                 LC_DYSYMTAB => {
-                    #[derive(FromBytes, FromZeroes, AsBytes)]
+                    #[derive(FromBytes, IntoBytes, KnownLayout)]
                     #[repr(C)]
                     pub struct DysymtabCommand {
                         pub cmd: u32,
@@ -567,8 +567,8 @@ impl Macho {
                         pub nlocrel: u32,
                     }
 
-                    let cmd = DysymtabCommand::mut_from_prefix(&mut self.data[*offset..])
-                        .ok_or(Error::InvalidObject("Failed to read dysymtab command"))?;
+                    let (cmd, _body) = DysymtabCommand::mut_from_prefix(&mut self.data[*offset..])
+                        .map_err(|_| Error::InvalidObject("Failed to read dysymtab command"))?;
                     shift_cmd!(cmd.tocoff);
                     shift_cmd!(cmd.modtaboff);
                     shift_cmd!(cmd.extrefsymoff);
@@ -584,7 +584,7 @@ impl Macho {
                 | LC_LINKER_OPTIMIZATION_HINT
                 | LC_DYLD_EXPORTS_TRIE
                 | LC_DYLD_CHAINED_FIXUPS => {
-                    #[derive(FromBytes, FromZeroes, AsBytes)]
+                    #[derive(FromBytes, IntoBytes, KnownLayout)]
                     #[repr(C)]
                     struct LinkeditDataCommand {
                         cmd: u32,
@@ -592,13 +592,13 @@ impl Macho {
                         dataoff: u32,
                         datasize: u32,
                     }
-                    let cmd = LinkeditDataCommand::mut_from_prefix(&mut self.data[*offset..])
-                        .ok_or(Error::InvalidObject("Failed to read linkedit data command"))?;
+                    let (cmd, _body) = LinkeditDataCommand::mut_from_prefix(&mut self.data[*offset..])
+                        .map_err(|_| Error::InvalidObject("Failed to read linkedit data command"))?;
                     shift_cmd!(cmd.dataoff);
                 }
 
                 LC_DYLD_INFO | LC_DYLD_INFO_ONLY => {
-                    #[derive(FromBytes, FromZeroes, AsBytes)]
+                    #[derive(FromBytes, IntoBytes, KnownLayout)]
                     #[repr(C)]
                     pub struct DyldInfoCommand {
                         pub cmd: u32,
@@ -614,8 +614,8 @@ impl Macho {
                         pub export_off: u32,
                         pub export_size: u32,
                     }
-                    let dyld_info = DyldInfoCommand::mut_from_prefix(&mut self.data[*offset..])
-                        .ok_or(Error::InvalidObject("Failed to read dyld info command"))?;
+                    let (dyld_info, _body) = DyldInfoCommand::mut_from_prefix(&mut self.data[*offset..])
+                        .map_err(|_| Error::InvalidObject("Failed to read dyld info command"))?;
                     shift_cmd!(dyld_info.rebase_off);
                     shift_cmd!(dyld_info.bind_off);
                     shift_cmd!(dyld_info.weak_bind_off);
@@ -640,8 +640,8 @@ impl Macho {
 
         for (cmd, cmdsize, offset) in self.commands.iter_mut() {
             if *cmd == LC_SEGMENT_64 {
-                let segcmd = SegmentCommand64::read_from_prefix(&self.data[*offset..])
-                    .ok_or(Error::InvalidObject("Failed to read segment command"))?;
+                let (segcmd, _body) = SegmentCommand64::read_from_prefix(&self.data[*offset..])
+                    .map_err(|_| Error::InvalidObject("Failed to read segment command"))?;
                 if segcmd.segname[..SEG_LINKEDIT.len()] == *SEG_LINKEDIT {
                     writer.write_all(self.seg.as_bytes())?;
                     writer.write_all(self.sec.as_bytes())?;
