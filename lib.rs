@@ -293,6 +293,7 @@ mod pe {
     };
 
     pub fn find_section(section_name: &str) -> std::io::Result<Option<&[u8]>> {
+        let section_name = section_name.to_uppercase();
         let section_name = CString::new(section_name)
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
 
@@ -314,7 +315,7 @@ mod pe {
 
             let resource_size = SizeofResource(current_process_hmod, resource_handle);
             if resource_size == 0 {
-                return Err(std::io::Error::last_os_error());
+                return Ok(Some(&[]));
             }
 
             let resource_ptr = LockResource(resource_data);
