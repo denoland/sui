@@ -480,6 +480,10 @@ impl Macho {
             0x1000
         };
 
+        let section_file_offset = size_of::<Header64>() as u64
+            + (self.header.sizeofcmds as u64 + self.seg.cmdsize as u64)
+            + (self.rest_size - self.seg.cmdsize as u64);
+
         self.seg = SegmentCommand64 {
             cmd: LC_SEGMENT_64,
             cmdsize: size_of::<SegmentCommand64>() as u32 + size_of::<Section64>() as u32,
@@ -487,7 +491,7 @@ impl Macho {
             vmaddr: self.linkedit_cmd.vmaddr,
             vmsize: align_vmsize(sectdata.len() as u64, page_size),
             filesize: align_vmsize(sectdata.len() as u64, page_size),
-            fileoff: self.linkedit_cmd.fileoff,
+            fileoff: section_file_offset,
             maxprot: 0x01,
             initprot: 0x01,
             nsects: 1,
@@ -500,7 +504,7 @@ impl Macho {
         self.sec = Section64 {
             addr: self.seg.vmaddr,
             size: sectdata.len() as u64,
-            offset: self.linkedit_cmd.fileoff as u32,
+            offset: section_file_offset as u32,
             align: if sectdata.len() < 16 { 0 } else { 4 },
             segname: SEGNAME,
             sectname,
@@ -638,6 +642,8 @@ impl Macho {
     pub fn build<W: Write>(mut self, writer: &mut W) -> Result<(), Error> {
         writer.write_all(self.header.as_bytes())?;
 
+        let cmd_size_increase = self.seg.cmdsize;
+
         for (cmd, cmdsize, offset) in self.commands.iter_mut() {
             if *cmd == LC_SEGMENT_64 {
                 let segcmd = SegmentCommand64::read_from_prefix(&self.data[*offset..])
@@ -646,6 +652,24 @@ impl Macho {
                     writer.write_all(self.seg.as_bytes())?;
                     writer.write_all(self.sec.as_bytes())?;
                     writer.write_all(self.linkedit_cmd.as_bytes())?;
+                    continue;
+                } else if segcmd.nsects > 0 {
+                    // Need to update section offsets for segments with sections
+                    let mut segment_data = self.data[*offset..*offset + *cmdsize as usize].to_vec();
+                    let mut seg_offset = size_of::<SegmentCommand64>();
+
+                    for _ in 0..segcmd.nsects {
+                        if seg_offset + size_of::<Section64>() <= segment_data.len() {
+                            let section =
+                                Section64::mut_from_prefix(&mut segment_data[seg_offset..])
+                                    .ok_or(Error::InvalidObject("Failed to read section"))?;
+                            if section.offset > 0 {
+                                section.offset += cmd_size_increase;
+                            }
+                        }
+                        seg_offset += size_of::<Section64>();
+                    }
+                    writer.write_all(&segment_data)?;
                     continue;
                 }
             }
