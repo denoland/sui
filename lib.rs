@@ -627,7 +627,9 @@ impl Macho {
                     shift_cmd!(dyld_info.export_off);
                 }
 
-                _ => {}
+                c => {
+                    println!("Missing 0x{:x}", c);
+                }
             }
         }
 
@@ -721,13 +723,14 @@ mod macho {
     use std::os::raw::c_char;
 
     extern "C" {
-        pub fn getsectdata(
+        pub fn getsegmentdata(
+            header: *const (),
             segname: *const c_char,
             sectname: *const c_char,
             size: *mut usize,
         ) -> *mut c_char;
 
-        pub fn _dyld_get_image_vmaddr_slide(image_index: usize) -> usize;
+        pub fn _dyld_get_image_header(i: u32) -> *const ();
     }
 
     pub fn find_section(section_name: &str) -> std::io::Result<Option<&[u8]>> {
@@ -736,7 +739,8 @@ mod macho {
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
 
         unsafe {
-            let mut ptr = getsectdata(
+            let ptr = getsegmentdata(
+                _dyld_get_image_header(0),
                 SEGNAME.as_ptr() as *const c_char,
                 section_name.as_ptr() as *const c_char,
                 &mut section_size as *mut usize,
@@ -746,9 +750,6 @@ mod macho {
                 return Ok(None);
             }
 
-            // Add the "virtual memory address slide" amount to ensure a valid pointer
-            // in cases where the virtual memory address have been adjusted by the OS.
-            ptr = ptr.wrapping_add(_dyld_get_image_vmaddr_slide(0));
             Ok(Some(std::slice::from_raw_parts(
                 ptr as *const u8,
                 section_size,
