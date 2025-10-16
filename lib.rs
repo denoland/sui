@@ -643,6 +643,7 @@ impl Macho {
         writer.write_all(self.header.as_bytes())?;
 
         let cmd_size_increase = self.seg.cmdsize;
+        let data_shift = self.seg.filesize;
 
         for (cmd, cmdsize, offset) in self.commands.iter_mut() {
             if *cmd == LC_SEGMENT_64 {
@@ -664,7 +665,12 @@ impl Macho {
                                 Section64::mut_from_prefix(&mut segment_data[seg_offset..])
                                     .ok_or(Error::InvalidObject("Failed to read section"))?;
                             if section.offset > 0 {
+                                // All existing sections need to account for the increased header size
                                 section.offset += cmd_size_increase;
+                                // Sections at or after the original LINKEDIT position need additional shift
+                                if section.offset as u64 >= self.linkedit_cmd.fileoff - data_shift {
+                                    section.offset += data_shift as u32;
+                                }
                             }
                         }
                         seg_offset += size_of::<Section64>();
