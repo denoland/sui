@@ -377,6 +377,9 @@ const SEG_LINKEDIT: &[u8] = b"__LINKEDIT";
 
 const LC_SEGMENT_64: u32 = 0x19;
 const LC_SYMTAB: u32 = 0x2;
+pub const LC_REQ_DYLD: u32 = 0x8000_0000;
+pub const LC_MAIN: u32 = 0x28 | LC_REQ_DYLD;
+
 const LC_DYSYMTAB: u32 = 0xb;
 pub(crate) const LC_CODE_SIGNATURE: u32 = 0x1d;
 const LC_FUNCTION_STARTS: u32 = 0x26;
@@ -626,6 +629,20 @@ impl Macho {
                     shift_cmd!(dyld_info.lazy_bind_off);
                     shift_cmd!(dyld_info.export_off);
                 }
+                LC_MAIN => {
+                    #[derive(FromBytes, FromZeroes, AsBytes)]
+                    #[repr(C)]
+                    pub struct MainCommand {
+                        pub cmd: u32,
+                        pub cmdsize: u32,
+                        pub entryoff: u32,
+                        pub stacksize: u32,
+                    }
+                    let main_cmd = MainCommand::mut_from_prefix(&mut self.data[*offset..])
+                        .ok_or(Error::InvalidObject("Failed to read main command"))?;
+                    // maybe?
+                    main_cmd.entryoff += self.seg.cmdsize as u32;
+                }
 
                 c => {
                     println!("Missing 0x{:x}", c);
@@ -667,10 +684,11 @@ impl Macho {
                                 Section64::mut_from_prefix(&mut segment_data[seg_offset..])
                                     .ok_or(Error::InvalidObject("Failed to read section"))?;
                             if section.offset > 0 {
+                                let off = section.offset as u64;
                                 // All existing sections need to account for the increased header size
                                 section.offset += cmd_size_increase;
                                 // Sections at or after the original LINKEDIT position need additional shift
-                                if section.offset as u64 >= self.linkedit_cmd.fileoff - data_shift {
+                                if off >= self.linkedit_cmd.fileoff - data_shift {
                                     section.offset += data_shift as u32;
                                 }
                             }
