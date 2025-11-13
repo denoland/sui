@@ -32,9 +32,11 @@ macro_rules! parameterized_test {
     };
 }
 
+#[cfg(target_vendor = "apple")]
 parameterized_test! { test_macho, size, {
 test_macho(size, false) } }
 
+#[cfg(target_vendor = "apple")]
 parameterized_test! { test_macho_sign, size, {
 test_macho(size, true) } }
 
