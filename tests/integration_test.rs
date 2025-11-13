@@ -109,6 +109,7 @@ fn test_macho(size: usize, sign: bool) {
     }
 }
 
+#[cfg(target_vendor = "apple")]
 test_macho! {
     test_macho_1: 1,
     test_macho_10: 10,
@@ -119,6 +120,7 @@ test_macho! {
     test_macho_1024_1024_5 : 1024 * 1024 * 5,
 }
 
+#[cfg(target_vendor = "apple")]
 test_macho_sign! {
     test_macho_1: 1,
     test_macho_10: 10,
