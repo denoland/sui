@@ -44,8 +44,22 @@ test_elf(size) } }
 parameterized_test! { test_pe, size, {
 test_pe(size) } }
 
+fn build_macho() {
+    assert_eq!(
+        std::process::Command::new("rustc")
+            .args(&["exec.rs", "-o", "exec_mach64"])
+            .current_dir("./tests")
+            .status()
+            .unwrap()
+            .code(),
+        Some(0),
+    );
+}
+
 fn test_macho(size: usize, sign: bool) {
     let _lock = PROCESS_LOCK.lock().unwrap();
+
+    build_macho();
 
     let input = std::fs::read("tests/exec_mach64").unwrap();
     let macho = Macho::from(input).unwrap();
