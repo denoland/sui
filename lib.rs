@@ -51,11 +51,13 @@ use editpe::{
     ResourceData, ResourceEntry, ResourceEntryName, ResourceTable,
 };
 use image::{imageops::FilterType::Lanczos3, ImageFormat, ImageReader};
+use std::io::BufReader;
 use std::io::Cursor;
 use std::io::Write;
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 pub mod apple_codesign;
+mod signtool_remove;
 
 #[cfg(all(unix, not(target_vendor = "apple")))]
 pub use elf::find_section;
@@ -280,7 +282,11 @@ impl<'a> PortableExecutable<'a> {
             .map_err(|_| Error::InternalError)?;
 
         let data = self.image.data();
-        writer.write_all(data)?;
+
+        {
+            let reader = BufReader::new(data);
+            signtool_remove::strip_security_from_reader(reader, writer)?;
+        }
         Ok(())
     }
 }
