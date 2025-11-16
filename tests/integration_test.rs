@@ -65,11 +65,11 @@ fn test_macho(size: usize, sign: bool) {
 
     let input = std::fs::read("tests/exec_mach64").unwrap();
     let macho = Macho::from(input).unwrap();
-    let _path = std::env::temp_dir().join("exec_mach64_out");
+    let path = std::env::temp_dir().join("exec_mach64_out");
     // Remove the file if it exists
     #[cfg(target_vendor = "apple")]
     {
-        let _ = std::fs::remove_file(&_path);
+        let _ = std::fs::remove_file(&path);
     }
 
     let data = vec![0; size];
@@ -81,7 +81,7 @@ fn test_macho(size: usize, sign: bool) {
         .create(true)
         .truncate(true)
         .mode(0o755)
-        .open(&_path)
+        .open(&path)
         .unwrap();
     let m = macho.write_section(RESOURCE_NAME, data).unwrap();
     if sign {
@@ -90,11 +90,14 @@ fn test_macho(size: usize, sign: bool) {
         m.build(&mut out).unwrap();
     }
 
-    #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+    #[cfg(target_vendor = "apple")]
     if sign {
         drop(out);
         // Run the output
-        let output = std::process::Command::new(&_path).output().unwrap();
+        let output = std::process::Command::new(&path).output().unwrap();
+        eprintln!("status: {}", output.status);
+        eprintln!("stdout: {}", String::from_utf8_lossy(&output.stdout));
+        eprintln!("stderr: {}", String::from_utf8_lossy(&output.stderr));
         assert!(output.status.success());
         // Verify the signature
         let output = std::process::Command::new("codesign")
@@ -102,7 +105,7 @@ fn test_macho(size: usize, sign: bool) {
             .arg("--deep")
             .arg("--strict")
             .arg("--verbose=2")
-            .arg(&_path)
+            .arg(&path)
             .output()
             .unwrap();
         assert!(output.status.success());
