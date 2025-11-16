@@ -20,6 +20,9 @@ jobs:
 
     steps:
     - uses: actions/checkout@v3
+    - name: Setup tmate session
+      if: ${{ matrix.os == 'macos-15-latest' }}
+      uses: mxschmitt/action-tmate@v3
     - name: Lint
       run: cargo clippy --all-features -- -D warnings
     - name: Test

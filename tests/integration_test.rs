@@ -32,11 +32,9 @@ macro_rules! parameterized_test {
     };
 }
 
-#[cfg(target_vendor = "apple")]
 parameterized_test! { test_macho, size, {
 test_macho(size, false) } }
 
-#[cfg(target_vendor = "apple")]
 parameterized_test! { test_macho_sign, size, {
 test_macho(size, true) } }
 
@@ -46,6 +44,7 @@ test_elf(size) } }
 parameterized_test! { test_pe, size, {
 test_pe(size) } }
 
+#[cfg(target_vendor = "apple")]
 fn build_macho() {
     assert_eq!(
         std::process::Command::new("rustc")
@@ -61,6 +60,7 @@ fn build_macho() {
 fn test_macho(size: usize, sign: bool) {
     let _lock = PROCESS_LOCK.lock().unwrap();
 
+    #[cfg(target_vendor = "apple")]
     build_macho();
 
     let input = std::fs::read("tests/exec_mach64").unwrap();
@@ -112,7 +112,6 @@ fn test_macho(size: usize, sign: bool) {
     }
 }
 
-#[cfg(target_vendor = "apple")]
 test_macho! {
     test_macho_1: 1,
     test_macho_10: 10,
@@ -123,7 +122,6 @@ test_macho! {
     test_macho_1024_1024_5 : 1024 * 1024 * 5,
 }
 
-#[cfg(target_vendor = "apple")]
 test_macho_sign! {
     test_macho_1: 1,
     test_macho_10: 10,
