@@ -812,18 +812,27 @@ mod elf {
 pub mod utils {
     /// Check if the given data is an ELF64 binary
     pub fn is_elf(data: &[u8]) -> bool {
+        if data.len() < 4 {
+            return false;
+        }
         let magic = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
         magic == 0x7f454c46
     }
 
     /// Check if the given data is a 64-bit Mach-O binary
     pub fn is_macho(data: &[u8]) -> bool {
+        if data.len() < 4 {
+            return false;
+        }
         let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         magic == 0xfeedfacf
     }
 
     /// Check if the given data is a PE32+ binary
     pub fn is_pe(data: &[u8]) -> bool {
+        if data.len() < 2 {
+            return false;
+        }
         let magic = u16::from_le_bytes([data[0], data[1]]);
         magic == 0x5a4d
     }
