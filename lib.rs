@@ -56,6 +56,7 @@ use std::io::Write;
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 pub mod apple_codesign;
+pub mod intel_mac;
 
 #[cfg(all(unix, not(target_vendor = "apple")))]
 pub use elf::find_section;
@@ -474,11 +475,14 @@ impl Macho {
     }
 
     pub fn write_section(mut self, name: &str, sectdata: Vec<u8>) -> Result<Self, Error> {
-        let page_size = if self.header.cputype == CPU_TYPE_ARM_64 {
-            0x10000
-        } else {
-            0x1000
-        };
+        // For Intel Mac, just store the data - we'll append it in build_and_sign
+        if self.header.cputype != CPU_TYPE_ARM_64 {
+            self.sectdata = Some(sectdata);
+            return Ok(self);
+        }
+
+        // ARM64: do the full segment manipulation
+        let page_size = 0x10000;
 
         self.seg = SegmentCommand64 {
             cmd: LC_SEGMENT_64,
@@ -679,7 +683,26 @@ impl Macho {
             let codesign = apple_codesign::MachoSigner::new(data)?;
             codesign.sign(writer)
         } else {
-            self.build(&mut writer)
+            // Intel macOS: append data with sentinel, then patch
+            let mut data = self.data;
+
+            if let Some(sectdata) = self.sectdata {
+                // Append sentinel marker
+                const SENTINEL: &[u8] = b"<~sui-data~>";
+                data.extend_from_slice(SENTINEL);
+
+                // Append data length (u64 little-endian)
+                data.extend_from_slice(&(sectdata.len() as u64).to_le_bytes());
+
+                // Append actual section data
+                data.extend_from_slice(&sectdata);
+            }
+
+            // Patch the Mach-O executable to fix __LINKEDIT and symbol table
+            intel_mac::patch_macho_executable(&mut data);
+
+            writer.write_all(&data)?;
+            Ok(())
         }
     }
 }
@@ -701,28 +724,39 @@ mod macho {
     }
 
     pub fn find_section(section_name: &str) -> std::io::Result<Option<&[u8]>> {
-        let mut section_size: usize = 0;
-        let section_name = CString::new(section_name)
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+        // Check if we're on Intel Mac by trying to detect architecture
+        // Intel Macs use the sentinel-based approach
+        #[cfg(target_arch = "x86_64")]
+        {
+            return super::intel_mac::find_section();
+        }
 
-        unsafe {
-            let mut ptr = getsectdata(
-                SEGNAME.as_ptr() as *const c_char,
-                section_name.as_ptr() as *const c_char,
-                &mut section_size as *mut usize,
-            );
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            // ARM64: use getsectdata
+            let mut section_size: usize = 0;
+            let section_name = CString::new(section_name)
+                .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
 
-            if ptr.is_null() {
-                return Ok(None);
+            unsafe {
+                let mut ptr = getsectdata(
+                    SEGNAME.as_ptr() as *const c_char,
+                    section_name.as_ptr() as *const c_char,
+                    &mut section_size as *mut usize,
+                );
+
+                if ptr.is_null() {
+                    return Ok(None);
+                }
+
+                // Add the "virtual memory address slide" amount to ensure a valid pointer
+                // in cases where the virtual memory address have been adjusted by the OS.
+                ptr = ptr.wrapping_add(_dyld_get_image_vmaddr_slide(0));
+                Ok(Some(std::slice::from_raw_parts(
+                    ptr as *const u8,
+                    section_size,
+                )))
             }
-
-            // Add the "virtual memory address slide" amount to ensure a valid pointer
-            // in cases where the virtual memory address have been adjusted by the OS.
-            ptr = ptr.wrapping_add(_dyld_get_image_vmaddr_slide(0));
-            Ok(Some(std::slice::from_raw_parts(
-                ptr as *const u8,
-                section_size,
-            )))
         }
     }
 }
