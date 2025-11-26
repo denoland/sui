@@ -709,33 +709,30 @@ impl Macho {
 
 #[cfg(target_vendor = "apple")]
 mod macho {
-    use super::SEGNAME;
-    use std::ffi::CString;
-    use std::os::raw::c_char;
-
-    extern "C" {
-        pub fn getsectdata(
-            segname: *const c_char,
-            sectname: *const c_char,
-            size: *mut usize,
-        ) -> *mut c_char;
-
-        pub fn _dyld_get_image_vmaddr_slide(image_index: usize) -> usize;
-    }
-
-    pub fn find_section(section_name: &str) -> std::io::Result<Option<&[u8]>> {
-        // Check if we're on Intel Mac by trying to detect architecture
-        // Intel Macs use the sentinel-based approach
+    pub fn find_section(_section_name: &str) -> std::io::Result<Option<&[u8]>> {
         #[cfg(target_arch = "x86_64")]
         {
-            return super::intel_mac::find_section();
+            super::intel_mac::find_section()
         }
 
         #[cfg(not(target_arch = "x86_64"))]
         {
-            // ARM64: use getsectdata
+            use super::SEGNAME;
+            use std::ffi::CString;
+            use std::os::raw::c_char;
+
+            extern "C" {
+                pub fn getsectdata(
+                    segname: *const c_char,
+                    sectname: *const c_char,
+                    size: *mut usize,
+                ) -> *mut c_char;
+
+                pub fn _dyld_get_image_vmaddr_slide(image_index: usize) -> usize;
+            }
+
             let mut section_size: usize = 0;
-            let section_name = CString::new(section_name)
+            let section_name = CString::new(_section_name)
                 .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
 
             unsafe {
