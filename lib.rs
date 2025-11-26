@@ -429,20 +429,17 @@ impl Macho {
         let header = Header64::read_from_prefix(&obj)
             .ok_or(Error::InvalidObject("Failed to read header"))?;
 
-        // For Intel Mac binaries, strip code signature first
+        // Atomically strip code signature first for intel binaries.
         let obj = if header.cputype != CPU_TYPE_ARM_64 {
             use std::io::Write;
 
-            // Create temporary file
             let tmp_dir = std::env::temp_dir();
             let tmp_path = tmp_dir.join(format!("sui_tmp_{}", std::process::id()));
 
-            // Write binary to temp file
             let mut tmp_file = std::fs::File::create(&tmp_path)?;
             tmp_file.write_all(&obj)?;
             drop(tmp_file);
 
-            // Remove code signature
             let output = std::process::Command::new("codesign")
                 .arg("--remove-signature")
                 .arg(&tmp_path)
