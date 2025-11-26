@@ -676,22 +676,15 @@ impl Macho {
     /// Build and write the modified Mach-O file
     pub fn build<W: Write>(mut self, writer: &mut W) -> Result<(), Error> {
         if self.header.cputype != CPU_TYPE_ARM_64 {
-            // Intel macOS: append data with sentinel, then patch
             let mut data = self.data;
 
             if let Some(sectdata) = self.sectdata {
-                // Append sentinel marker
                 const SENTINEL: &[u8] = b"<~sui-data~>";
                 data.extend_from_slice(SENTINEL);
-
-                // Append data length (u64 little-endian)
                 data.extend_from_slice(&(sectdata.len() as u64).to_le_bytes());
-
-                // Append actual section data
                 data.extend_from_slice(&sectdata);
             }
 
-            // Patch the Mach-O executable to fix __LINKEDIT and symbol table
             intel_mac::patch_macho_executable(&mut data);
             return Ok(());
         };
