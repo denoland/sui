@@ -732,7 +732,34 @@ impl Macho {
             let codesign = apple_codesign::MachoSigner::new(data)?;
             codesign.sign(writer)
         } else {
-            self.build(&mut writer)?;
+            // For Intel binaries, build to a temporary file and run adhoc codesign
+            let tmp_dir = std::env::temp_dir();
+            let tmp_path = tmp_dir.join(format!("sui_sign_{}", std::process::id()));
+
+            {
+                let mut tmp_file = std::fs::File::create(&tmp_path)?;
+                self.build(&mut tmp_file)?;
+            }
+
+            // Run adhoc codesign
+            let output = std::process::Command::new("codesign")
+                .arg("-s")
+                .arg("-")
+                .arg(&tmp_path)
+                .output()?;
+
+            if !output.status.success() {
+                eprintln!(
+                    "Warning: Failed to adhoc codesign binary: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+
+            // Read the (possibly signed) binary and write to output
+            let signed_data = std::fs::read(&tmp_path)?;
+            writer.write_all(&signed_data)?;
+            std::fs::remove_file(&tmp_path).ok();
+
             Ok(())
         }
     }
