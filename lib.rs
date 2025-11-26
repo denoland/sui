@@ -428,6 +428,44 @@ impl Macho {
     pub fn from(obj: Vec<u8>) -> Result<Self, Error> {
         let header = Header64::read_from_prefix(&obj)
             .ok_or(Error::InvalidObject("Failed to read header"))?;
+
+        // For Intel Mac binaries, strip code signature first
+        let obj = if header.cputype != CPU_TYPE_ARM_64 {
+            use std::io::Write;
+
+            // Create temporary file
+            let tmp_dir = std::env::temp_dir();
+            let tmp_path = tmp_dir.join(format!("sui_tmp_{}", std::process::id()));
+
+            // Write binary to temp file
+            let mut tmp_file = std::fs::File::create(&tmp_path)?;
+            tmp_file.write_all(&obj)?;
+            drop(tmp_file);
+
+            // Remove code signature
+            let output = std::process::Command::new("codesign")
+                .arg("--remove-signature")
+                .arg(&tmp_path)
+                .output()?;
+
+            if !output.status.success() {
+                // If codesign fails, just use the original binary
+                eprintln!(
+                    "Warning: Failed to remove code signature: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                std::fs::remove_file(&tmp_path).ok();
+                obj
+            } else {
+                // Read the stripped binary
+                let stripped = std::fs::read(&tmp_path)?;
+                std::fs::remove_file(&tmp_path).ok();
+                stripped
+            }
+        } else {
+            obj
+        };
+
         let mut commands: Vec<(u32, u32, usize)> = Vec::with_capacity(header.ncmds as usize);
 
         let mut offset = size_of::<Header64>();
