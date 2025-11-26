@@ -91,7 +91,7 @@ fn test_macho(size: usize, sign: bool) {
     }
 
     #[cfg(target_vendor = "apple")]
-    if sign {
+    if sign || cfg!(target_arch = "x86_64") {
         drop(out);
         // Run the output
         let output = std::process::Command::new(&path).output().unwrap();
@@ -99,16 +99,18 @@ fn test_macho(size: usize, sign: bool) {
         eprintln!("stdout: {}", String::from_utf8_lossy(&output.stdout));
         eprintln!("stderr: {}", String::from_utf8_lossy(&output.stderr));
         assert!(output.status.success());
-        // Verify the signature
-        let output = std::process::Command::new("codesign")
-            .arg("--verify")
-            .arg("--deep")
-            .arg("--strict")
-            .arg("--verbose=2")
-            .arg(&path)
-            .output()
-            .unwrap();
-        assert!(output.status.success());
+        if sign {
+            // Verify the signature
+            let output = std::process::Command::new("codesign")
+                .arg("--verify")
+                .arg("--deep")
+                .arg("--strict")
+                .arg("--verbose=2")
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+        }
     }
 }
 
