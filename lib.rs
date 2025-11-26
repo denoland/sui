@@ -732,9 +732,7 @@ impl Macho {
             let codesign = apple_codesign::MachoSigner::new(data)?;
             codesign.sign(writer)
         } else {
-            let mut data = Vec::new();
-            self.build(&mut data)?;
-            writer.write_all(&data)?;
+            self.build(&mut writer)?;
             Ok(())
         }
     }

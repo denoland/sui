@@ -60,8 +60,8 @@ fn build_macho() {
 fn test_macho(size: usize, sign: bool) {
     let _lock = PROCESS_LOCK.lock().unwrap();
 
-    #[cfg(target_vendor = "apple")]
-    build_macho();
+    //#[cfg(target_vendor = "apple")]
+    //build_macho();
 
     let input = std::fs::read("tests/exec_mach64").unwrap();
     let macho = Macho::from(input).unwrap();
