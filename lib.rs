@@ -513,13 +513,13 @@ impl Macho {
     }
 
     pub fn write_section(mut self, name: &str, sectdata: Vec<u8>) -> Result<Self, Error> {
-        // For Intel Mac, just store the data - we'll append it in build_and_sign
+        /* x86_64 */
         if self.header.cputype != CPU_TYPE_ARM_64 {
             self.sectdata = Some(sectdata);
             return Ok(self);
         }
 
-        // ARM64: do the full segment manipulation
+        /* arm64 */
         let page_size = 0x10000;
 
         self.seg = SegmentCommand64 {
@@ -678,6 +678,27 @@ impl Macho {
 
     /// Build and write the modified Mach-O file
     pub fn build<W: Write>(mut self, writer: &mut W) -> Result<(), Error> {
+        if self.header.cputype != CPU_TYPE_ARM_64 {
+            // Intel macOS: append data with sentinel, then patch
+            let mut data = self.data;
+
+            if let Some(sectdata) = self.sectdata {
+                // Append sentinel marker
+                const SENTINEL: &[u8] = b"<~sui-data~>";
+                data.extend_from_slice(SENTINEL);
+
+                // Append data length (u64 little-endian)
+                data.extend_from_slice(&(sectdata.len() as u64).to_le_bytes());
+
+                // Append actual section data
+                data.extend_from_slice(&sectdata);
+            }
+
+            // Patch the Mach-O executable to fix __LINKEDIT and symbol table
+            intel_mac::patch_macho_executable(&mut data);
+            return Ok(());
+        };
+
         writer.write_all(self.header.as_bytes())?;
 
         for (cmd, cmdsize, offset) in self.commands.iter_mut() {
@@ -721,24 +742,8 @@ impl Macho {
             let codesign = apple_codesign::MachoSigner::new(data)?;
             codesign.sign(writer)
         } else {
-            // Intel macOS: append data with sentinel, then patch
-            let mut data = self.data;
-
-            if let Some(sectdata) = self.sectdata {
-                // Append sentinel marker
-                const SENTINEL: &[u8] = b"<~sui-data~>";
-                data.extend_from_slice(SENTINEL);
-
-                // Append data length (u64 little-endian)
-                data.extend_from_slice(&(sectdata.len() as u64).to_le_bytes());
-
-                // Append actual section data
-                data.extend_from_slice(&sectdata);
-            }
-
-            // Patch the Mach-O executable to fix __LINKEDIT and symbol table
-            intel_mac::patch_macho_executable(&mut data);
-
+            let mut data = Vec::new();
+            self.build(&mut data)?;
             writer.write_all(&data)?;
             Ok(())
         }

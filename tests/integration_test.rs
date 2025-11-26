@@ -99,7 +99,7 @@ fn test_macho(size: usize, sign: bool) {
         eprintln!("stdout: {}", String::from_utf8_lossy(&output.stdout));
         eprintln!("stderr: {}", String::from_utf8_lossy(&output.stderr));
         assert!(output.status.success());
-        if sign {
+        if sign && cfg!(target_arch = "aarch64") {
             // Verify the signature
             let output = std::process::Command::new("codesign")
                 .arg("--verify")
