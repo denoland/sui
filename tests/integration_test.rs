@@ -44,7 +44,7 @@ test_elf(size) } }
 parameterized_test! { test_pe, size, {
 test_pe(size) } }
 
-#[cfg(target_vendor = "apple")]
+#[cfg(all(target_vendor = "apple", target_arch = "x86_64"))]
 fn build_macho() {
     assert_eq!(
         std::process::Command::new("rustc")
@@ -60,8 +60,8 @@ fn build_macho() {
 fn test_macho(size: usize, sign: bool) {
     let _lock = PROCESS_LOCK.lock().unwrap();
 
-    //#[cfg(target_vendor = "apple")]
-    //build_macho();
+    #[cfg(all(target_vendor = "apple", target_arch = "x86_64"))]
+    build_macho();
 
     let input = std::fs::read("tests/exec_mach64").unwrap();
     let macho = Macho::from(input).unwrap();
