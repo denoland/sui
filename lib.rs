@@ -56,6 +56,7 @@ use std::io::Write;
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 pub mod apple_codesign;
+pub mod intel_mac;
 
 #[cfg(all(unix, not(target_vendor = "apple")))]
 pub use elf::find_section;
@@ -427,6 +428,41 @@ impl Macho {
     pub fn from(obj: Vec<u8>) -> Result<Self, Error> {
         let header = Header64::read_from_prefix(&obj)
             .ok_or(Error::InvalidObject("Failed to read header"))?;
+
+        // Atomically strip code signature first for intel binaries.
+        let obj = if header.cputype != CPU_TYPE_ARM_64 {
+            use std::io::Write;
+
+            let tmp_dir = std::env::temp_dir();
+            let tmp_path = tmp_dir.join(format!("sui_tmp_{}", std::process::id()));
+
+            let mut tmp_file = std::fs::File::create(&tmp_path)?;
+            tmp_file.write_all(&obj)?;
+            drop(tmp_file);
+
+            let output = std::process::Command::new("codesign")
+                .arg("--remove-signature")
+                .arg(&tmp_path)
+                .output()?;
+
+            if !output.status.success() {
+                // If codesign fails, just use the original binary
+                eprintln!(
+                    "Warning: Failed to remove code signature: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                std::fs::remove_file(&tmp_path).ok();
+                obj
+            } else {
+                // Read the stripped binary
+                let stripped = std::fs::read(&tmp_path)?;
+                std::fs::remove_file(&tmp_path).ok();
+                stripped
+            }
+        } else {
+            obj
+        };
+
         let mut commands: Vec<(u32, u32, usize)> = Vec::with_capacity(header.ncmds as usize);
 
         let mut offset = size_of::<Header64>();
@@ -474,11 +510,14 @@ impl Macho {
     }
 
     pub fn write_section(mut self, name: &str, sectdata: Vec<u8>) -> Result<Self, Error> {
-        let page_size = if self.header.cputype == CPU_TYPE_ARM_64 {
-            0x10000
-        } else {
-            0x1000
-        };
+        /* x86_64 */
+        if self.header.cputype != CPU_TYPE_ARM_64 {
+            self.sectdata = Some(sectdata);
+            return Ok(self);
+        }
+
+        /* arm64 */
+        let page_size = 0x10000;
 
         self.seg = SegmentCommand64 {
             cmd: LC_SEGMENT_64,
@@ -636,6 +675,20 @@ impl Macho {
 
     /// Build and write the modified Mach-O file
     pub fn build<W: Write>(mut self, writer: &mut W) -> Result<(), Error> {
+        if self.header.cputype != CPU_TYPE_ARM_64 {
+            let mut data = self.data;
+
+            if let Some(sectdata) = self.sectdata {
+                const SENTINEL: &[u8] = b"<~sui-data~>";
+                data.extend_from_slice(SENTINEL);
+                data.extend_from_slice(&(sectdata.len() as u64).to_le_bytes());
+                data.extend_from_slice(&sectdata);
+            }
+
+            intel_mac::patch_macho_executable(&mut data);
+            return Ok(());
+        };
+
         writer.write_all(self.header.as_bytes())?;
 
         for (cmd, cmdsize, offset) in self.commands.iter_mut() {
@@ -679,50 +732,59 @@ impl Macho {
             let codesign = apple_codesign::MachoSigner::new(data)?;
             codesign.sign(writer)
         } else {
-            self.build(&mut writer)
+            self.build(&mut writer)?;
+            Ok(())
         }
     }
 }
 
 #[cfg(target_vendor = "apple")]
 mod macho {
-    use super::SEGNAME;
-    use std::ffi::CString;
-    use std::os::raw::c_char;
+    pub fn find_section(_section_name: &str) -> std::io::Result<Option<&[u8]>> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            super::intel_mac::find_section()
+        }
 
-    extern "C" {
-        pub fn getsectdata(
-            segname: *const c_char,
-            sectname: *const c_char,
-            size: *mut usize,
-        ) -> *mut c_char;
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            use super::SEGNAME;
+            use std::ffi::CString;
+            use std::os::raw::c_char;
 
-        pub fn _dyld_get_image_vmaddr_slide(image_index: usize) -> usize;
-    }
+            extern "C" {
+                pub fn getsectdata(
+                    segname: *const c_char,
+                    sectname: *const c_char,
+                    size: *mut usize,
+                ) -> *mut c_char;
 
-    pub fn find_section(section_name: &str) -> std::io::Result<Option<&[u8]>> {
-        let mut section_size: usize = 0;
-        let section_name = CString::new(section_name)
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
-
-        unsafe {
-            let mut ptr = getsectdata(
-                SEGNAME.as_ptr() as *const c_char,
-                section_name.as_ptr() as *const c_char,
-                &mut section_size as *mut usize,
-            );
-
-            if ptr.is_null() {
-                return Ok(None);
+                pub fn _dyld_get_image_vmaddr_slide(image_index: usize) -> usize;
             }
 
-            // Add the "virtual memory address slide" amount to ensure a valid pointer
-            // in cases where the virtual memory address have been adjusted by the OS.
-            ptr = ptr.wrapping_add(_dyld_get_image_vmaddr_slide(0));
-            Ok(Some(std::slice::from_raw_parts(
-                ptr as *const u8,
-                section_size,
-            )))
+            let mut section_size: usize = 0;
+            let section_name = CString::new(_section_name)
+                .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+
+            unsafe {
+                let mut ptr = getsectdata(
+                    SEGNAME.as_ptr() as *const c_char,
+                    section_name.as_ptr() as *const c_char,
+                    &mut section_size as *mut usize,
+                );
+
+                if ptr.is_null() {
+                    return Ok(None);
+                }
+
+                // Add the "virtual memory address slide" amount to ensure a valid pointer
+                // in cases where the virtual memory address have been adjusted by the OS.
+                ptr = ptr.wrapping_add(_dyld_get_image_vmaddr_slide(0));
+                Ok(Some(std::slice::from_raw_parts(
+                    ptr as *const u8,
+                    section_size,
+                )))
+            }
         }
     }
 }

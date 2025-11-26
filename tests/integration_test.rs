@@ -44,16 +44,32 @@ test_elf(size) } }
 parameterized_test! { test_pe, size, {
 test_pe(size) } }
 
+#[cfg(all(target_vendor = "apple", target_arch = "x86_64"))]
+fn build_macho() {
+    assert_eq!(
+        std::process::Command::new("rustc")
+            .args(&["exec.rs", "-o", "exec_mach64"])
+            .current_dir("./tests")
+            .status()
+            .unwrap()
+            .code(),
+        Some(0),
+    );
+}
+
 fn test_macho(size: usize, sign: bool) {
     let _lock = PROCESS_LOCK.lock().unwrap();
 
+    #[cfg(all(target_vendor = "apple", target_arch = "x86_64"))]
+    build_macho();
+
     let input = std::fs::read("tests/exec_mach64").unwrap();
     let macho = Macho::from(input).unwrap();
-    let _path = std::env::temp_dir().join("exec_mach64_out");
+    let path = std::env::temp_dir().join("exec_mach64_out");
     // Remove the file if it exists
     #[cfg(target_vendor = "apple")]
     {
-        let _ = std::fs::remove_file(&_path);
+        let _ = std::fs::remove_file(&path);
     }
 
     let data = vec![0; size];
@@ -65,7 +81,7 @@ fn test_macho(size: usize, sign: bool) {
         .create(true)
         .truncate(true)
         .mode(0o755)
-        .open(&_path)
+        .open(&path)
         .unwrap();
     let m = macho.write_section(RESOURCE_NAME, data).unwrap();
     if sign {
@@ -74,22 +90,27 @@ fn test_macho(size: usize, sign: bool) {
         m.build(&mut out).unwrap();
     }
 
-    #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
-    if sign {
+    #[cfg(target_vendor = "apple")]
+    if sign || cfg!(target_arch = "x86_64") {
         drop(out);
         // Run the output
-        let output = std::process::Command::new(&_path).output().unwrap();
+        let output = std::process::Command::new(&path).output().unwrap();
+        eprintln!("status: {}", output.status);
+        eprintln!("stdout: {}", String::from_utf8_lossy(&output.stdout));
+        eprintln!("stderr: {}", String::from_utf8_lossy(&output.stderr));
         assert!(output.status.success());
-        // Verify the signature
-        let output = std::process::Command::new("codesign")
-            .arg("--verify")
-            .arg("--deep")
-            .arg("--strict")
-            .arg("--verbose=2")
-            .arg(&_path)
-            .output()
-            .unwrap();
-        assert!(output.status.success());
+        if sign && cfg!(target_arch = "aarch64") {
+            // Verify the signature
+            let output = std::process::Command::new("codesign")
+                .arg("--verify")
+                .arg("--deep")
+                .arg("--strict")
+                .arg("--verbose=2")
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+        }
     }
 }
 
