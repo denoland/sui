@@ -383,6 +383,7 @@ pub(crate) const LC_CODE_SIGNATURE: u32 = 0x1d;
 const LC_FUNCTION_STARTS: u32 = 0x26;
 const LC_DATA_IN_CODE: u32 = 0x29;
 const LC_DYLD_INFO: u32 = 0x22;
+const LC_ATOM_INFO: u32 = 0x36;
 const LC_DYLD_INFO_ONLY: u32 = 0x80000022;
 const LC_DYLIB_CODE_SIGN_DRS: u32 = 0x2b;
 const LC_LINKER_OPTIMIZATION_HINT: u32 = 0x2d;
@@ -620,6 +621,7 @@ impl Macho {
                 | LC_FUNCTION_STARTS
                 | LC_DATA_IN_CODE
                 | LC_DYLIB_CODE_SIGN_DRS
+                | LC_ATOM_INFO
                 | LC_LINKER_OPTIMIZATION_HINT
                 | LC_DYLD_EXPORTS_TRIE
                 | LC_DYLD_CHAINED_FIXUPS => {
