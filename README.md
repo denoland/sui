@@ -47,6 +47,8 @@ let data = find_section("hello.txt")?;
 
 ### Mach-O
 
+#### ARM64 (Apple Silicon)
+
 Resource is added as section in a new segment, load commands are updated and
 offsets are adjusted. `__LINKEDIT` is kept at the end of the file.
 
@@ -54,6 +56,20 @@ It is similar to linker's `-sectcreate,__FOO,__foo,hello.txt` option.
 
 Note that `Macho::build` will invalidate existing code signature. on Apple
 sillicon, kernel refuses to run executables with bad signatures.
+
+#### x86_64 (Intel Mac)
+
+For Intel Macs, a simpler approach is used:
+
+1. The existing code signature is stripped using `codesign --remove-signature`
+2. Data is appended to the end of the binary with a sentinel marker.
+3. The `__LINKEDIT` segment and symbol table sizes are patched to account for
+   the appended data.
+
+At runtime, the data is extracted by searching backwards from the end of the
+file for the sentinel marker.
+
+#### Code Signing
 
 Use `Macho::build_and_sign` to re-sign the binary with ad-hoc signature. See
 [`apple_codesign.rs`](./apple_codesign.rs) for details. This is similar to
@@ -104,6 +120,7 @@ future.
 This crate is fuzzed with LLVM's libFuzzer. See [fuzz/](fuzz/).
 
 `exec_*` executables in `tests/` are compiled from `tests/exec.rs`:
+
 ```
 rustc exec.rs -o exec_elf64 --target x86_64-unknown-linux-gnu
 ```
