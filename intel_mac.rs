@@ -96,37 +96,58 @@ pub fn find_section() -> std::io::Result<Option<&'static [u8]>> {
     // Get file size
     let file_size = file.seek(SeekFrom::End(0))?;
 
-    // Search backwards for sentinel
-    let search_size = std::cmp::min(file_size, 1024 * 1024); // Search last 1MB
-    file.seek(SeekFrom::End(-(search_size as i64)))?;
+    // Search backwards for sentinel in chunks to avoid allocating huge buffer
+    const CHUNK_SIZE: usize = 1024 * 1024; // 1MB chunks
+    let overlap = SENTINEL.len() + 8; // Overlap to handle sentinel across chunk boundaries
 
-    let mut buf = vec![0u8; search_size as usize];
-    file.read_exact(&mut buf)?;
+    let mut pos = file_size;
+    let mut prev_chunk_tail = vec![0u8; 0];
 
-    // Find sentinel from the end
-    for i in (0..=(buf.len() - SENTINEL.len())).rev() {
-        if &buf[i..i + SENTINEL.len()] == SENTINEL {
-            // Found sentinel, read data length (u64 after sentinel)
-            if i + SENTINEL.len() + 8 > buf.len() {
-                return Ok(None);
+    while pos > 0 {
+        let chunk_start = pos.saturating_sub(CHUNK_SIZE as u64);
+        let chunk_len = (pos - chunk_start) as usize;
+
+        file.seek(SeekFrom::Start(chunk_start))?;
+        let mut chunk = vec![0u8; chunk_len];
+        file.read_exact(&mut chunk)?;
+
+        // Append previous chunk tail for overlap handling
+        chunk.extend_from_slice(&prev_chunk_tail);
+
+        // Find sentinel from the end of this chunk
+        for i in (0..=(chunk.len().saturating_sub(SENTINEL.len()))).rev() {
+            if &chunk[i..i + SENTINEL.len()] == SENTINEL {
+                // Found sentinel, read data length (u64 after sentinel)
+                if i + SENTINEL.len() + 8 > chunk.len() {
+                    return Ok(None);
+                }
+
+                let len_bytes: [u8; 8] = chunk[i + SENTINEL.len()..i + SENTINEL.len() + 8]
+                    .try_into()
+                    .map_err(|_| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid length")
+                    })?;
+                let data_len = u64::from_le_bytes(len_bytes) as usize;
+
+                // Read the actual data
+                let data_start = i + SENTINEL.len() + 8;
+                if data_start + data_len > chunk.len() {
+                    return Ok(None);
+                }
+
+                let data = chunk[data_start..data_start + data_len].to_vec();
+                return Ok(Some(Box::leak(data.into_boxed_slice())));
             }
-
-            let len_bytes: [u8; 8] = buf[i + SENTINEL.len()..i + SENTINEL.len() + 8]
-                .try_into()
-                .map_err(|_| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid length")
-                })?;
-            let data_len = u64::from_le_bytes(len_bytes) as usize;
-
-            // Read the actual data
-            let data_start = i + SENTINEL.len() + 8;
-            if data_start + data_len > buf.len() {
-                return Ok(None);
-            }
-
-            let data = buf[data_start..data_start + data_len].to_vec();
-            return Ok(Some(Box::leak(data.into_boxed_slice())));
         }
+
+        // Save tail of current chunk for next iteration (for overlap)
+        prev_chunk_tail = if chunk_len > overlap {
+            chunk[..overlap].to_vec()
+        } else {
+            chunk
+        };
+
+        pos = chunk_start;
     }
 
     Ok(None)
