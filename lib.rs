@@ -688,6 +688,7 @@ impl Macho {
             }
 
             intel_mac::patch_macho_executable(&mut data);
+            writer.write_all(&data)?;
             return Ok(());
         };
 
