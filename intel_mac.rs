@@ -132,9 +132,17 @@ pub fn find_section() -> std::io::Result<Option<&'static [u8]>> {
                 // Read the actual data
                 let data_start = i + SENTINEL.len() + 8;
                 if data_start + data_len > chunk.len() {
-                    return Ok(None);
+                    // We need to read the rest of the data from the file
+                    let mut data = chunk[data_start..].to_vec(); // data we already have
+                    let remaining = data_len - (chunk.len() - data_start); // how much we need to read
+                    file.seek(SeekFrom::Start(chunk_start + chunk.len() as u64))?;
+                    if chunk.len() < remaining {
+                        chunk.extend(std::iter::repeat_n(0, remaining - chunk.len()));
+                    }
+                    file.read_exact(&mut chunk[..remaining])?;
+                    data.extend_from_slice(&chunk[..remaining]);
+                    return Ok(Some(Box::leak(data.into_boxed_slice())));
                 }
-
                 let data = chunk[data_start..data_start + data_len].to_vec();
                 return Ok(Some(Box::leak(data.into_boxed_slice())));
             }
