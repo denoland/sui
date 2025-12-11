@@ -681,8 +681,14 @@ impl Macho {
             let mut data = self.data;
 
             if let Some(sectdata) = self.sectdata {
-                const SENTINEL: &[u8] = b"<~sui-data~>";
-                data.extend_from_slice(SENTINEL);
+                // sentinel is "<~sui-data~>". the reason this is written as a byte array is to avoid
+                // having the sentinel in the string table of the binary (because then we'd find the sentinel in the string table,
+                // even with no injected data)
+                #[allow(clippy::byte_char_slices)]
+                let sentinel = [
+                    b'<', b'~', b's', b'u', b'i', b'-', b'd', b'a', b't', b'a', b'~', b'>',
+                ];
+                data.extend_from_slice(&sentinel);
                 data.extend_from_slice(&(sectdata.len() as u64).to_le_bytes());
                 data.extend_from_slice(&sectdata);
             }

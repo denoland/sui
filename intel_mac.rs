@@ -88,7 +88,13 @@ fn patch_command(cmd_type: u32, buf: &mut [u8], file_len: usize) {
 pub fn find_section() -> std::io::Result<Option<&'static [u8]>> {
     use std::io::{Read, Seek, SeekFrom};
 
-    const SENTINEL: &[u8] = b"<~sui-data~>";
+    // sentinel is "<~sui-data~>". the reason this is written as a byte array is to avoid
+    // having the sentinel in the string table of the binary (because then we'd find the sentinel in the string table,
+    // even with no injected data)
+    #[allow(clippy::byte_char_slices)]
+    let sentinel: &[u8] = &[
+        b'<', b'~', b's', b'u', b'i', b'-', b'd', b'a', b't', b'a', b'~', b'>',
+    ];
 
     let exe = std::env::current_exe()?;
     let mut file = std::fs::File::open(exe)?;
@@ -98,7 +104,7 @@ pub fn find_section() -> std::io::Result<Option<&'static [u8]>> {
 
     // Search backwards for sentinel in chunks to avoid allocating huge buffer
     const CHUNK_SIZE: usize = 1024 * 1024; // 1MB chunks
-    let overlap = SENTINEL.len() + 8; // Overlap to handle sentinel across chunk boundaries
+    let overlap = sentinel.len() + 8; // Overlap to handle sentinel across chunk boundaries
 
     let mut pos = file_size;
     let mut prev_chunk_tail = vec![0u8; 0];
@@ -115,14 +121,14 @@ pub fn find_section() -> std::io::Result<Option<&'static [u8]>> {
         chunk.extend_from_slice(&prev_chunk_tail);
 
         // Find sentinel from the end of this chunk
-        for i in (0..=(chunk.len().saturating_sub(SENTINEL.len()))).rev() {
-            if &chunk[i..i + SENTINEL.len()] == SENTINEL {
+        for i in (0..=(chunk.len().saturating_sub(sentinel.len()))).rev() {
+            if &chunk[i..i + sentinel.len()] == sentinel {
                 // Found sentinel, read data length (u64 after sentinel)
-                if i + SENTINEL.len() + 8 > chunk.len() {
+                if i + sentinel.len() + 8 > chunk.len() {
                     return Ok(None);
                 }
 
-                let len_bytes: [u8; 8] = chunk[i + SENTINEL.len()..i + SENTINEL.len() + 8]
+                let len_bytes: [u8; 8] = chunk[i + sentinel.len()..i + sentinel.len() + 8]
                     .try_into()
                     .map_err(|_| {
                         std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid length")
@@ -130,7 +136,7 @@ pub fn find_section() -> std::io::Result<Option<&'static [u8]>> {
                 let data_len = u64::from_le_bytes(len_bytes) as usize;
 
                 // Read the actual data
-                let data_start = i + SENTINEL.len() + 8;
+                let data_start = i + sentinel.len() + 8;
                 if data_start + data_len > chunk.len() {
                     // We need to read the rest of the data from the file
                     let mut data = chunk[data_start..].to_vec(); // data we already have
