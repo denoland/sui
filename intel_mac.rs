@@ -98,10 +98,11 @@ pub fn find_section() -> std::io::Result<Option<&'static [u8]>> {
 
     // Search backwards for sentinel in chunks to avoid allocating huge buffer
     const CHUNK_SIZE: usize = 1024 * 1024; // 1MB chunks
-    let overlap = SENTINEL.len() + 8; // Overlap to handle sentinel across chunk boundaries
+    const OVERLAP: usize = 64; // Enough for sentinel + length + small data
 
     let mut pos = file_size;
-    let mut prev_chunk_tail = vec![0u8; 0];
+    let mut overlap_buf = [0u8; OVERLAP];
+    let mut overlap_len = 0;
 
     while pos > 0 {
         let chunk_start = pos.saturating_sub(CHUNK_SIZE as u64);
@@ -111,49 +112,52 @@ pub fn find_section() -> std::io::Result<Option<&'static [u8]>> {
         let mut chunk = vec![0u8; chunk_len];
         file.read_exact(&mut chunk)?;
 
-        // Append previous chunk tail for overlap handling
-        chunk.extend_from_slice(&prev_chunk_tail);
+        // Search in chunk
+        if let Some(idx) = chunk.windows(SENTINEL.len()).rposition(|w| w == SENTINEL) {
+            let sentinel_pos = chunk_start + idx as u64;
+            let len_pos = sentinel_pos + SENTINEL.len() as u64;
 
-        // Find sentinel from the end of this chunk
-        for i in (0..=(chunk.len().saturating_sub(SENTINEL.len()))).rev() {
-            if &chunk[i..i + SENTINEL.len()] == SENTINEL {
-                // Found sentinel, read data length (u64 after sentinel)
-                if i + SENTINEL.len() + 8 > chunk.len() {
-                    return Ok(None);
-                }
+            // Read length
+            file.seek(SeekFrom::Start(len_pos))?;
+            let mut len_bytes = [0u8; 8];
+            file.read_exact(&mut len_bytes)?;
+            let data_len = u64::from_le_bytes(len_bytes) as usize;
 
-                let len_bytes: [u8; 8] = chunk[i + SENTINEL.len()..i + SENTINEL.len() + 8]
-                    .try_into()
-                    .map_err(|_| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid length")
-                    })?;
+            // Read data
+            let mut data = vec![0u8; data_len];
+            file.read_exact(&mut data)?;
+            return Ok(Some(Box::leak(data.into_boxed_slice())));
+        }
+
+        // Check overlap region for sentinel spanning chunks
+        if overlap_len > 0 {
+            let combined_len = OVERLAP.min(chunk_len) + overlap_len;
+            let mut combined = vec![0u8; combined_len];
+            let chunk_part = OVERLAP.min(chunk_len);
+            combined[..chunk_part].copy_from_slice(&chunk[..chunk_part]);
+            combined[chunk_part..].copy_from_slice(&overlap_buf[..overlap_len]);
+
+            if let Some(idx) = combined
+                .windows(SENTINEL.len())
+                .rposition(|w| w == SENTINEL)
+            {
+                let sentinel_pos = chunk_start + idx as u64;
+                let len_pos = sentinel_pos + SENTINEL.len() as u64;
+
+                file.seek(SeekFrom::Start(len_pos))?;
+                let mut len_bytes = [0u8; 8];
+                file.read_exact(&mut len_bytes)?;
                 let data_len = u64::from_le_bytes(len_bytes) as usize;
 
-                // Read the actual data
-                let data_start = i + SENTINEL.len() + 8;
-                if data_start + data_len > chunk.len() {
-                    // We need to read the rest of the data from the file
-                    let mut data = chunk[data_start..].to_vec(); // data we already have
-                    let remaining = data_len - (chunk.len() - data_start); // how much we need to read
-                    file.seek(SeekFrom::Start(chunk_start + chunk.len() as u64))?;
-                    if chunk.len() < remaining {
-                        chunk.extend(std::iter::repeat_n(0, remaining - chunk.len()));
-                    }
-                    file.read_exact(&mut chunk[..remaining])?;
-                    data.extend_from_slice(&chunk[..remaining]);
-                    return Ok(Some(Box::leak(data.into_boxed_slice())));
-                }
-                let data = chunk[data_start..data_start + data_len].to_vec();
+                let mut data = vec![0u8; data_len];
+                file.read_exact(&mut data)?;
                 return Ok(Some(Box::leak(data.into_boxed_slice())));
             }
         }
 
-        // Save tail of current chunk for next iteration (for overlap)
-        prev_chunk_tail = if chunk_len > overlap {
-            chunk[..overlap].to_vec()
-        } else {
-            chunk
-        };
+        // Save overlap for next iteration
+        overlap_len = OVERLAP.min(chunk_len);
+        overlap_buf[..overlap_len].copy_from_slice(&chunk[..overlap_len]);
 
         pos = chunk_start;
     }
