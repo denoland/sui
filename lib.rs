@@ -681,6 +681,9 @@ impl Macho {
             let mut data = self.data;
 
             if let Some(sectdata) = self.sectdata {
+                // sentinel is "<~sui-data~>". the reason this is written as a byte array is to avoid
+                // having the sentinel in the string table of the binary (because then we'd find the sentinel in the string table,
+                // even with no injected data)
                 let sentinel = [
                     b'<', b'~', b's', b'u', b'i', b'-', b'd', b'a', b't', b'a', b'~', b'>',
                 ];

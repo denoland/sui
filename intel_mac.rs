@@ -88,6 +88,9 @@ fn patch_command(cmd_type: u32, buf: &mut [u8], file_len: usize) {
 pub fn find_section() -> std::io::Result<Option<&'static [u8]>> {
     use std::io::{Read, Seek, SeekFrom};
 
+    // sentinel is "<~sui-data~>". the reason this is written as a byte array is to avoid
+    // having the sentinel in the string table of the binary (because then we'd find the sentinel in the string table,
+    // even with no injected data)
     let sentinel: &[u8] = &[
         b'<', b'~', b's', b'u', b'i', b'-', b'd', b'a', b't', b'a', b'~', b'>',
     ];
@@ -130,12 +133,6 @@ pub fn find_section() -> std::io::Result<Option<&'static [u8]>> {
                         std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid length")
                     })?;
                 let data_len = u64::from_le_bytes(len_bytes) as usize;
-
-                eprintln!(
-                    "FOUND sentinel: {:?}",
-                    String::from_utf8_lossy(&chunk[i..i + sentinel.len()])
-                );
-                eprintln!("Data length: {}", data_len);
 
                 // Read the actual data
                 let data_start = i + sentinel.len() + 8;
