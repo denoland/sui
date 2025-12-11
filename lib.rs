@@ -681,8 +681,10 @@ impl Macho {
             let mut data = self.data;
 
             if let Some(sectdata) = self.sectdata {
-                const SENTINEL: &[u8] = b"<~sui-data~>";
-                data.extend_from_slice(SENTINEL);
+                let sentinel = [
+                    b'<', b'~', b's', b'u', b'i', b'-', b'd', b'a', b't', b'a', b'~', b'>',
+                ];
+                data.extend_from_slice(&sentinel);
                 data.extend_from_slice(&(sectdata.len() as u64).to_le_bytes());
                 data.extend_from_slice(&sectdata);
             }
