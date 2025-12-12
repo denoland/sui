@@ -88,12 +88,13 @@ fn patch_command(cmd_type: u32, buf: &mut [u8], file_len: usize) {
 pub fn find_section() -> std::io::Result<Option<&'static [u8]>> {
     use std::io::{Read, Seek, SeekFrom};
 
-    // sentinel is "<~sui-data~>". the reason this is written as a byte array is to avoid
-    // having the sentinel in the string table of the binary (because then we'd find the sentinel in the string table,
-    // even with no injected data)
+    // sentinel is "<~sui-data~>" + magic bytes 0xDEADBEEF to avoid
+    // having the sentinel literal in the string table of the binary which could
+    // cause OOM issues during search when matching static string tables
     #[allow(clippy::byte_char_slices)]
     let sentinel: &[u8] = &[
-        b'<', b'~', b's', b'u', b'i', b'-', b'd', b'a', b't', b'a', b'~', b'>',
+        b'<', b'~', b's', b'u', b'i', b'-', b'd', b'a', b't', b'a', b'~', b'>', 0xDE, 0xAD, 0xBE,
+        0xEF, // magic bytes to make sentinel unique
     ];
 
     let exe = std::env::current_exe()?;

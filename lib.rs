@@ -681,12 +681,13 @@ impl Macho {
             let mut data = self.data;
 
             if let Some(sectdata) = self.sectdata {
-                // sentinel is "<~sui-data~>". the reason this is written as a byte array is to avoid
-                // having the sentinel in the string table of the binary (because then we'd find the sentinel in the string table,
-                // even with no injected data)
+                // sentinel is "<~sui-data~>" + magic bytes 0xDEADBEEF to avoid
+                // having the sentinel literal in the string table of the binary which could
+                // cause OOM issues during search when matching static string tables
                 #[allow(clippy::byte_char_slices)]
                 let sentinel = [
-                    b'<', b'~', b's', b'u', b'i', b'-', b'd', b'a', b't', b'a', b'~', b'>',
+                    b'<', b'~', b's', b'u', b'i', b'-', b'd', b'a', b't', b'a', b'~', b'>', 0xDE,
+                    0xAD, 0xBE, 0xEF, // magic bytes to make sentinel unique
                 ];
                 data.extend_from_slice(&sentinel);
                 data.extend_from_slice(&(sectdata.len() as u64).to_le_bytes());
