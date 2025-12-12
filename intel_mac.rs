@@ -88,14 +88,13 @@ fn patch_command(cmd_type: u32, buf: &mut [u8], file_len: usize) {
 pub fn find_section() -> std::io::Result<Option<&'static [u8]>> {
     use std::io::{Read, Seek, SeekFrom};
 
-    // sentinel is "<~sui-data~>" + magic bytes 0xDEADBEEF to avoid
-    // having the sentinel literal in the string table of the binary which could
-    // cause OOM issues during search when matching static string tables
-    #[allow(clippy::byte_char_slices)]
-    let sentinel: &[u8] = &[
-        b'<', b'~', b's', b'u', b'i', b'-', b'd', b'a', b't', b'a', b'~', b'>', 0xDE, 0xAD, 0xBE,
-        0xEF, // magic bytes to make sentinel unique
-    ];
+    // Construct sentinel dynamically to avoid having it as contiguous bytes in the binary
+    // If we use a static byte array, the compiler embeds it in the binary and we'd find
+    // that instead of the actual embedded data, causing OOM from bogus length values
+    let mut sentinel = Vec::with_capacity(16);
+    sentinel.extend_from_slice(b"<~sui-data~>");
+    sentinel.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+    let sentinel = sentinel.as_slice();
 
     let exe = std::env::current_exe()?;
     let mut file = std::fs::File::open(exe)?;

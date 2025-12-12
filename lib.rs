@@ -681,14 +681,12 @@ impl Macho {
             let mut data = self.data;
 
             if let Some(sectdata) = self.sectdata {
-                // sentinel is "<~sui-data~>" + magic bytes 0xDEADBEEF to avoid
-                // having the sentinel literal in the string table of the binary which could
-                // cause OOM issues during search when matching static string tables
-                #[allow(clippy::byte_char_slices)]
-                let sentinel = [
-                    b'<', b'~', b's', b'u', b'i', b'-', b'd', b'a', b't', b'a', b'~', b'>', 0xDE,
-                    0xAD, 0xBE, 0xEF, // magic bytes to make sentinel unique
-                ];
+                // Construct sentinel dynamically to avoid having it as contiguous bytes in the binary
+                // If we use a static byte array, the compiler embeds it in the binary and we'd find
+                // that instead of the actual embedded data, causing OOM from bogus length values
+                let mut sentinel = Vec::with_capacity(16);
+                sentinel.extend_from_slice(b"<~sui-data~>");
+                sentinel.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
                 data.extend_from_slice(&sentinel);
                 data.extend_from_slice(&(sectdata.len() as u64).to_le_bytes());
                 data.extend_from_slice(&sectdata);
