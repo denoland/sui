@@ -681,13 +681,16 @@ impl Macho {
             let mut data = self.data;
 
             if let Some(sectdata) = self.sectdata {
-                // sentinel is "<~sui-data~>". the reason this is written as a byte array is to avoid
-                // having the sentinel in the string table of the binary (because then we'd find the sentinel in the string table,
-                // even with no injected data)
-                #[allow(clippy::byte_char_slices)]
-                let sentinel = [
-                    b'<', b'~', b's', b'u', b'i', b'-', b'd', b'a', b't', b'a', b'~', b'>',
-                ];
+                // Construct sentinel from reversed string to prevent it from existing as contiguous
+                // bytes in the binary. Use black_box to prevent compiler from const-evaluating.
+                let mut sentinel = Vec::with_capacity(16);
+                let reversed = std::hint::black_box(b">~atad-ius~<"); // "<~sui-data~>" reversed
+                for &byte in reversed.iter().rev() {
+                    sentinel.push(byte);
+                }
+                // Add magic bytes in reverse order with black_box
+                let magic = std::hint::black_box([0xEF, 0xBE, 0xAD, 0xDE]);
+                sentinel.extend_from_slice(&magic);
                 data.extend_from_slice(&sentinel);
                 data.extend_from_slice(&(sectdata.len() as u64).to_le_bytes());
                 data.extend_from_slice(&sectdata);
