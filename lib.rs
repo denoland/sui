@@ -681,12 +681,16 @@ impl Macho {
             let mut data = self.data;
 
             if let Some(sectdata) = self.sectdata {
-                // Construct sentinel dynamically to avoid having it as contiguous bytes in the binary
-                // If we use a static byte array, the compiler embeds it in the binary and we'd find
-                // that instead of the actual embedded data, causing OOM from bogus length values
+                // Construct sentinel from reversed string to prevent it from existing as contiguous
+                // bytes in the binary. Use black_box to prevent compiler from const-evaluating.
                 let mut sentinel = Vec::with_capacity(16);
-                sentinel.extend_from_slice(b"<~sui-data~>");
-                sentinel.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+                let reversed = std::hint::black_box(b">~atad-ius~<"); // "<~sui-data~>" reversed
+                for &byte in reversed.iter().rev() {
+                    sentinel.push(byte);
+                }
+                // Add magic bytes in reverse order with black_box
+                let magic = std::hint::black_box([0xEF, 0xBE, 0xAD, 0xDE]);
+                sentinel.extend_from_slice(&magic);
                 data.extend_from_slice(&sentinel);
                 data.extend_from_slice(&(sectdata.len() as u64).to_le_bytes());
                 data.extend_from_slice(&sectdata);
