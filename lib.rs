@@ -755,6 +755,7 @@ impl Macho {
 
             // Run adhoc codesign
             let output = std::process::Command::new("codesign")
+                .arg("--timestamp=none")
                 .arg("-s")
                 .arg("-")
                 .arg(&tmp_path)
