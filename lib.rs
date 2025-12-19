@@ -435,6 +435,7 @@ impl Macho {
             use std::io::Write;
 
             let tmp_dir = std::env::temp_dir();
+            std::fs::create_dir_all(&tmp_dir)?;
             let tmp_path = tmp_dir.join(format!("sui_tmp_{}", std::process::id()));
 
             let mut tmp_file = std::fs::File::create(&tmp_path)?;
@@ -746,6 +747,7 @@ impl Macho {
         } else {
             // For Intel binaries, build to a temporary file and run adhoc codesign
             let tmp_dir = std::env::temp_dir();
+            std::fs::create_dir_all(&tmp_dir)?;
             let tmp_path = tmp_dir.join(format!("sui_sign_{}", std::process::id()));
 
             {
