@@ -478,9 +478,6 @@ impl Macho {
             obj
         };
 
-        #[cfg(not(target_vendor = "apple"))]
-        let obj = obj;
-
         let mut commands: Vec<(u32, u32, usize)> = Vec::with_capacity(header.ncmds as usize);
 
         let mut offset = size_of::<Header64>();
