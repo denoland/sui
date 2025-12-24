@@ -431,6 +431,7 @@ impl Macho {
             .ok_or(Error::InvalidObject("Failed to read header"))?;
 
         // Atomically strip code signature first for intel binaries.
+        #[cfg(target_vendor = "apple")]
         let obj = if header.cputype != CPU_TYPE_ARM_64 {
             use std::io::Write;
 
@@ -442,28 +443,43 @@ impl Macho {
             tmp_file.write_all(&obj)?;
             drop(tmp_file);
 
-            let output = std::process::Command::new("codesign")
+            match std::process::Command::new("codesign")
                 .arg("--remove-signature")
                 .arg(&tmp_path)
-                .output()?;
-
-            if !output.status.success() {
-                // If codesign fails, just use the original binary
-                eprintln!(
-                    "Warning: Failed to remove code signature: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                std::fs::remove_file(&tmp_path).ok();
-                obj
-            } else {
-                // Read the stripped binary
-                let stripped = std::fs::read(&tmp_path)?;
-                std::fs::remove_file(&tmp_path).ok();
-                stripped
+                .output()
+            {
+                Ok(output) => {
+                    if !output.status.success() {
+                        // If codesign fails, just use the original binary
+                        eprintln!(
+                            "Warning: Failed to remove code signature: {}",
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                        std::fs::remove_file(&tmp_path).ok();
+                        obj
+                    } else {
+                        // Read the stripped binary
+                        let stripped = std::fs::read(&tmp_path)?;
+                        std::fs::remove_file(&tmp_path).ok();
+                        stripped
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // codesign not found, skip it
+                    std::fs::remove_file(&tmp_path).ok();
+                    obj
+                }
+                Err(e) => {
+                    std::fs::remove_file(&tmp_path).ok();
+                    return Err(e.into());
+                }
             }
         } else {
             obj
         };
+
+        #[cfg(not(target_vendor = "apple"))]
+        let obj = obj;
 
         let mut commands: Vec<(u32, u32, usize)> = Vec::with_capacity(header.ncmds as usize);
 
@@ -746,35 +762,55 @@ impl Macho {
             codesign.sign(writer)
         } else {
             // For Intel binaries, build to a temporary file and run adhoc codesign
-            let tmp_dir = std::env::temp_dir();
-            std::fs::create_dir_all(&tmp_dir)?;
-            let tmp_path = tmp_dir.join(format!("sui_sign_{}", std::process::id()));
-
+            #[cfg(target_vendor = "apple")]
             {
-                let mut tmp_file = std::fs::File::create(&tmp_path)?;
-                self.build(&mut tmp_file)?;
+                let tmp_dir = std::env::temp_dir();
+                std::fs::create_dir_all(&tmp_dir)?;
+                let tmp_path = tmp_dir.join(format!("sui_sign_{}", std::process::id()));
+
+                {
+                    let mut tmp_file = std::fs::File::create(&tmp_path)?;
+                    self.build(&mut tmp_file)?;
+                }
+
+                // Run adhoc codesign
+                match std::process::Command::new("codesign")
+                    .arg("-s")
+                    .arg("-")
+                    .arg(&tmp_path)
+                    .output()
+                {
+                    Ok(output) => {
+                        if !output.status.success() {
+                            eprintln!(
+                                "Warning: Failed to adhoc codesign binary: {}",
+                                String::from_utf8_lossy(&output.stderr)
+                            );
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // codesign not found, skip it
+                    }
+                    Err(e) => {
+                        std::fs::remove_file(&tmp_path).ok();
+                        return Err(e.into());
+                    }
+                }
+
+                // Read the (possibly signed) binary and write to output
+                let signed_data = std::fs::read(&tmp_path)?;
+                writer.write_all(&signed_data)?;
+                std::fs::remove_file(&tmp_path).ok();
+
+                Ok(())
             }
 
-            // Run adhoc codesign
-            let output = std::process::Command::new("codesign")
-                .arg("-s")
-                .arg("-")
-                .arg(&tmp_path)
-                .output()?;
-
-            if !output.status.success() {
-                eprintln!(
-                    "Warning: Failed to adhoc codesign binary: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
+            #[cfg(not(target_vendor = "apple"))]
+            {
+                // On non-macOS, just build directly without codesign
+                self.build(&mut writer)?;
+                Ok(())
             }
-
-            // Read the (possibly signed) binary and write to output
-            let signed_data = std::fs::read(&tmp_path)?;
-            writer.write_all(&signed_data)?;
-            std::fs::remove_file(&tmp_path).ok();
-
-            Ok(())
         }
     }
 }

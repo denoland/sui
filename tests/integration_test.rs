@@ -234,3 +234,24 @@ fn utils() {
     assert!(!utils::is_macho(&pe));
     assert!(!utils::is_pe(&macho));
 }
+
+/// This test ensures that processing Intel Mac binaries works even when
+/// codesign is not available (e.g., when cross-compiling from Linux).
+#[test]
+fn test_cross_platform_intel_mac_injection() {
+    let _lock = PROCESS_LOCK.lock().unwrap();
+
+    let input = std::fs::read("tests/exec_mach64_intel").unwrap();
+    let macho = Macho::from(input).unwrap();
+
+    let data = vec![0x42; 1024];
+    let macho = macho.write_section(RESOURCE_NAME, data).unwrap();
+
+    let mut output = Vec::new();
+    macho.build_and_sign(&mut output).unwrap();
+
+    // Verify we got some output
+    assert!(!output.is_empty());
+    assert!(utils::is_macho(&output));
+}
+
