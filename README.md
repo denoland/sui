@@ -110,7 +110,10 @@ extracted using `FindResource` and `LoadResource` at run-time.
 ### ELF
 
 Data is stored in ELF notes using a section of type `SHT_NOTE` and a program
-header of type `PT_NOTE`.
+header of type `PT_NOTE`. The `.note.sui` section is placed inside a `PT_LOAD`
+segment so it is mapped at runtime, while the `PT_NOTE` program header points
+to the same mapped range. Existing ELF notes are preserved by appending the
+new SUI note to the note segment data.
 
 At run-time, data is extracted from note segments in memory using
 `dl_iterate_phdr`.

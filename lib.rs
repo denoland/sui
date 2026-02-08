@@ -52,9 +52,9 @@ use editpe::{
 };
 use image::{imageops::FilterType::Lanczos3, ImageFormat, ImageReader};
 #[cfg(all(unix, not(target_vendor = "apple")))]
-use object::read::elf::{FileHeader, ProgramHeader, SectionHeader};
+use object::endian::Endianness;
 #[cfg(all(unix, not(target_vendor = "apple")))]
-use object::read::Object;
+use object::read::elf::{FileHeader, ProgramHeader, SectionHeader};
 use std::io::Cursor;
 use std::io::Write;
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
@@ -919,8 +919,8 @@ fn parse_elf_note_desc<'a>(desc: &'a [u8], name: &str) -> Option<&'a [u8]> {
 }
 
 #[cfg(all(unix, not(target_vendor = "apple")))]
-pub fn find_section_in_bytes(data: &[u8], name: &str) -> Option<&[u8]> {
-    let elf_file = object::read::elf::ElfFile64::parse(data).ok()?;
+pub fn find_section_in_bytes<'a>(data: &'a [u8], name: &str) -> Option<&'a [u8]> {
+    let elf_file = object::read::elf::ElfFile64::<Endianness, _>::parse(data).ok()?;
     let endian = elf_file.endian();
 
     let section_table = elf_file.elf_section_table();
@@ -930,7 +930,7 @@ pub fn find_section_in_bytes(data: &[u8], name: &str) -> Option<&[u8]> {
                 continue;
             };
             while let Ok(Some(note)) = notes.next() {
-                if note.name() != ELF_NOTE_NAME[..ELF_NOTE_NAME.len() - 1] {
+                if note.name() != &ELF_NOTE_NAME[..ELF_NOTE_NAME.len() - 1] {
                     continue;
                 }
                 if note.n_type(endian) != ELF_NOTE_TYPE_SECTION_DATA {
@@ -951,7 +951,7 @@ pub fn find_section_in_bytes(data: &[u8], name: &str) -> Option<&[u8]> {
             continue;
         };
         while let Ok(Some(note)) = notes.next() {
-            if note.name() != ELF_NOTE_NAME[..ELF_NOTE_NAME.len() - 1] {
+            if note.name() != &ELF_NOTE_NAME[..ELF_NOTE_NAME.len() - 1] {
                 continue;
             }
             if note.n_type(endian) != ELF_NOTE_TYPE_SECTION_DATA {
@@ -978,6 +978,33 @@ impl<'a> Elf<'a> {
     ) -> Result<(), Error> {
         use object::build::elf as e;
         let note_data = build_elf_note_payload(name, sectdata);
+        let combined_note_data = {
+            let existing = object::read::elf::ElfFile64::<Endianness, _>::parse(self.data)
+                .ok()
+                .and_then(|elf_file| {
+                    let endian = elf_file.endian();
+                    let header = elf_file.elf_header();
+                    let segments = header.program_headers(endian, self.data).ok()?;
+                    for segment in segments {
+                        if segment.p_type(endian) != object::elf::PT_NOTE {
+                            continue;
+                        }
+                        let data = segment.data(endian, self.data).ok()?;
+                        if !data.is_empty() {
+                            return Some(data);
+                        }
+                    }
+                    None
+                });
+            if let Some(existing) = existing {
+                let mut combined = Vec::with_capacity(existing.len() + note_data.len());
+                combined.extend_from_slice(existing);
+                combined.extend_from_slice(&note_data);
+                combined
+            } else {
+                note_data.clone()
+            }
+        };
 
         let mut builder =
             e::Builder::read(self.data).map_err(|_| Error::InvalidObject("Failed to parse ELF"))?;
@@ -987,21 +1014,105 @@ impl<'a> Elf<'a> {
         section.sh_type = object::elf::SHT_NOTE;
         section.sh_flags = object::elf::SHF_ALLOC as u64;
         section.sh_addralign = 4;
-        section.data = e::SectionData::Note(note_data.into());
+        section.data = e::SectionData::Note(combined_note_data.into());
         let section_id = section.id();
 
         builder.set_section_sizes();
 
-        let segment = builder.segments.add();
-        segment.p_type = object::elf::PT_NOTE;
-        segment.p_flags = object::elf::PF_R;
-        segment.p_align = 4;
-        segment.append_section(builder.sections.get_mut(section_id));
+        let mut max_end = 0u64;
+        for existing in builder.sections.iter() {
+            if existing.delete {
+                continue;
+            }
+            let filesz = if existing.sh_type == object::elf::SHT_NOBITS {
+                0
+            } else {
+                existing.sh_size
+            };
+            let end = existing.sh_offset + filesz;
+            if end > max_end {
+                max_end = end;
+            }
+        }
+        let load_segment_id = builder
+            .segments
+            .iter()
+            .filter(|segment| segment.is_load())
+            .max_by_key(|segment| segment.p_offset + segment.p_filesz)
+            .map(|segment| segment.id());
+
+        {
+            let section = builder.sections.get_mut(section_id);
+            let align = if let Some(load_segment_id) = load_segment_id {
+                let seg = builder.segments.get(load_segment_id);
+                (seg.p_align as usize)
+                    .max(section.sh_addralign as usize)
+                    .max(1)
+            } else {
+                (section.sh_addralign as usize).max(1)
+            };
+            section.sh_offset = align_up(max_end as usize, align) as u64;
+            section.sh_addr = if let Some(load_segment_id) = load_segment_id {
+                let seg = builder.segments.get(load_segment_id);
+                seg.p_vaddr + (section.sh_offset - seg.p_offset)
+            } else {
+                0
+            };
+        }
+
+        if let Some(load_segment_id) = load_segment_id {
+            let section = builder.sections.get_mut(section_id);
+            let seg = builder.segments.get_mut(load_segment_id);
+            let section_end = section.sh_offset + section.sh_size;
+            let mem_end = section.sh_addr + section.sh_size;
+            if section_end > seg.p_offset + seg.p_filesz {
+                seg.p_filesz = section_end - seg.p_offset;
+            }
+            if mem_end > seg.p_vaddr + seg.p_memsz {
+                seg.p_memsz = mem_end - seg.p_vaddr;
+            }
+            if !seg.sections.iter().any(|&id| id == section_id) {
+                seg.sections.push(section_id);
+            }
+        }
+
+        let note_segment_id = builder
+            .segments
+            .iter()
+            .find(|segment| segment.p_type == object::elf::PT_NOTE)
+            .map(|segment| segment.id());
+
+        if let Some(note_segment_id) = note_segment_id {
+            let section = builder.sections.get_mut(section_id);
+            let segment = builder.segments.get_mut(note_segment_id);
+            segment.sections.clear();
+            segment.sections.push(section_id);
+            segment.p_type = object::elf::PT_NOTE;
+            segment.p_flags = object::elf::PF_R;
+            segment.p_align = 4;
+            segment.p_offset = section.sh_offset;
+            segment.p_vaddr = section.sh_addr;
+            segment.p_paddr = section.sh_addr;
+            segment.p_filesz = section.sh_size;
+            segment.p_memsz = section.sh_size;
+        } else {
+            let section = builder.sections.get_mut(section_id);
+            let segment = builder.segments.add();
+            segment.p_type = object::elf::PT_NOTE;
+            segment.p_flags = object::elf::PF_R;
+            segment.p_align = 4;
+            segment.p_offset = section.sh_offset;
+            segment.p_vaddr = section.sh_addr;
+            segment.p_paddr = section.sh_addr;
+            segment.p_filesz = section.sh_size;
+            segment.p_memsz = section.sh_size;
+            segment.sections.push(section_id);
+        }
 
         let mut out = Vec::new();
         builder
             .write(&mut out)
-            .map_err(|_| Error::InvalidObject("Failed to write ELF"))?;
+            .map_err(|err| Error::IoError(std::io::Error::new(std::io::ErrorKind::Other, err)))?;
         writer.write_all(&out)?;
         Ok(())
     }
