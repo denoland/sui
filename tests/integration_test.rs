@@ -174,6 +174,43 @@ test_elf! {
     test_elf_1024_1024_5 : 1024 * 1024 * 5,
 }
 
+#[cfg(all(unix, not(target_vendor = "apple")))]
+#[test]
+fn test_elf_note_survives_strip() {
+    let _lock = PROCESS_LOCK.lock().unwrap();
+
+    let input = std::fs::read("tests/exec_elf64").unwrap();
+    let elf = Elf::new(&input);
+    let path = std::env::temp_dir().join("exec_elf64_strip_out");
+
+    let payload = b"hello-strip-note".to_vec();
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o755)
+        .open(&path)
+        .unwrap();
+    elf.append(RESOURCE_NAME, &payload, &mut out).unwrap();
+    drop(out);
+
+    let bytes = std::fs::read(&path).unwrap();
+    let section = libsui::find_section_in_bytes(&bytes, RESOURCE_NAME).unwrap();
+    assert_eq!(section, payload.as_slice());
+
+    let status = std::process::Command::new("strip").arg(&path).status();
+    match status {
+        Ok(status) if status.success() => {}
+        Ok(_) => panic!("strip failed"),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+        Err(err) => panic!("failed to run strip: {}", err),
+    }
+
+    let stripped = std::fs::read(&path).unwrap();
+    let section = libsui::find_section_in_bytes(&stripped, RESOURCE_NAME).unwrap();
+    assert_eq!(section, payload.as_slice());
+}
+
 fn test_pe(size: usize) {
     let _lock = PROCESS_LOCK.lock().unwrap();
 
@@ -254,4 +291,3 @@ fn test_cross_platform_intel_mac_injection() {
     assert!(!output.is_empty());
     assert!(utils::is_macho(&output));
 }
-

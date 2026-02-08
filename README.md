@@ -109,11 +109,11 @@ extracted using `FindResource` and `LoadResource` at run-time.
 
 ### ELF
 
-Data is simply appended to the end of the file and extracted from
-`current_exe()` at run-time.
+Data is stored in ELF notes using a section of type `SHT_NOTE` and a program
+header of type `PT_NOTE`.
 
-This is subject to change and may use ELF linker notes (`PT_NOTE`) in the
-future.
+At run-time, data is extracted from note segments in memory using
+`dl_iterate_phdr`.
 
 ## Testing
 
