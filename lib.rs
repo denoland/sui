@@ -882,6 +882,9 @@ fn align_up(value: usize, align: usize) -> usize {
     }
 }
 
+// ELF note payload layout:
+// [namesz:u32][descsz:u32][type:u32][name bytes]["SUI\\0" padded to 4]
+// [desc bytes][u16 name_len][name][section_data][desc padded to 4]
 fn build_elf_note_payload(section_name: &str, section_data: &[u8]) -> Vec<u8> {
     let name_len = section_name.len();
     let name_len_u16 = u16::try_from(name_len).expect("section name too long");
@@ -916,53 +919,6 @@ fn parse_elf_note_desc<'a>(desc: &'a [u8], name: &str) -> Option<&'a [u8]> {
         return None;
     }
     Some(&desc[2 + name_len..])
-}
-
-#[cfg(all(unix, not(target_vendor = "apple")))]
-pub fn find_section_in_bytes<'a>(data: &'a [u8], name: &str) -> Option<&'a [u8]> {
-    let elf_file = object::read::elf::ElfFile64::<Endianness, _>::parse(data).ok()?;
-    let endian = elf_file.endian();
-
-    let section_table = elf_file.elf_section_table();
-    if !section_table.is_empty() {
-        for section in section_table.iter() {
-            let Ok(Some(mut notes)) = section.notes(endian, data) else {
-                continue;
-            };
-            while let Ok(Some(note)) = notes.next() {
-                if note.name() != &ELF_NOTE_NAME[..ELF_NOTE_NAME.len() - 1] {
-                    continue;
-                }
-                if note.n_type(endian) != ELF_NOTE_TYPE_SECTION_DATA {
-                    continue;
-                }
-                if let Some(section_data) = parse_elf_note_desc(note.desc(), name) {
-                    return Some(section_data);
-                }
-            }
-        }
-        return None;
-    }
-
-    let header = elf_file.elf_header();
-    let segments = header.program_headers(endian, data).ok()?;
-    for segment in segments {
-        let Ok(Some(mut notes)) = segment.notes(endian, data) else {
-            continue;
-        };
-        while let Ok(Some(note)) = notes.next() {
-            if note.name() != &ELF_NOTE_NAME[..ELF_NOTE_NAME.len() - 1] {
-                continue;
-            }
-            if note.n_type(endian) != ELF_NOTE_TYPE_SECTION_DATA {
-                continue;
-            }
-            if let Some(section_data) = parse_elf_note_desc(note.desc(), name) {
-                return Some(section_data);
-            }
-        }
-    }
-    None
 }
 
 impl<'a> Elf<'a> {
@@ -1188,8 +1144,11 @@ mod elf {
                     let segment = unsafe { std::slice::from_raw_parts(pos as *const u8, len) };
                     let align = (phdr.p_align as usize).max(4);
                     if let Some(section_data) = find_in_note_segment(segment, align, name) {
-                        let data = section_data.to_vec();
-                        return Ok(Some(Box::leak(data.into_boxed_slice())));
+                        // SAFETY: `segment` points into a mapped PT_LOAD range of the main
+                        // executable. That mapping stays valid for the process lifetime,
+                        // so it is safe to extend the slice's lifetime to 'static here.
+                        let data: &'static [u8] = unsafe { std::mem::transmute(section_data) };
+                        return Ok(Some(data));
                     }
                 }
             }

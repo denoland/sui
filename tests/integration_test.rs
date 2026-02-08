@@ -195,7 +195,7 @@ fn test_elf_note_survives_strip() {
     drop(out);
 
     let bytes = std::fs::read(&path).unwrap();
-    let section = libsui::find_section_in_bytes(&bytes, RESOURCE_NAME).unwrap();
+    let section = find_section_in_bytes(&bytes, RESOURCE_NAME).unwrap();
     assert_eq!(section, payload.as_slice());
 
     let output = std::process::Command::new("strip").arg(&path).output();
@@ -216,7 +216,7 @@ fn test_elf_note_survives_strip() {
     }
 
     let stripped = std::fs::read(&path).unwrap();
-    let section = libsui::find_section_in_bytes(&stripped, RESOURCE_NAME).unwrap();
+    let section = find_section_in_bytes(&stripped, RESOURCE_NAME).unwrap();
     assert_eq!(section, payload.as_slice());
 }
 
@@ -292,6 +292,71 @@ fn test_elf_note_mapped_and_preserves() {
 
     assert!(has_gnu, "expected GNU note to be preserved");
     assert!(has_sui, "expected SUI note to be appended");
+}
+
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn find_section_in_bytes<'a>(data: &'a [u8], name: &str) -> Option<&'a [u8]> {
+    use object::endian::Endianness;
+    use object::read::elf::{ElfFile64, FileHeader, ProgramHeader, SectionHeader};
+
+    let elf_file = ElfFile64::<Endianness, _>::parse(data).ok()?;
+    let endian = elf_file.endian();
+
+    let section_table = elf_file.elf_section_table();
+    if !section_table.is_empty() {
+        for section in section_table.iter() {
+            let Ok(Some(mut notes)) = section.notes(endian, data) else {
+                continue;
+            };
+            while let Ok(Some(note)) = notes.next() {
+                if trim_note_name(note.name()) != b"SUI" {
+                    continue;
+                }
+                if note.n_type(endian) != 0x5355_4901 {
+                    continue;
+                }
+                if let Some(section_data) = parse_elf_note_desc(note.desc(), name) {
+                    return Some(section_data);
+                }
+            }
+        }
+        return None;
+    }
+
+    let header = elf_file.elf_header();
+    let segments = header.program_headers(endian, data).ok()?;
+    for segment in segments {
+        let Ok(Some(mut notes)) = segment.notes(endian, data) else {
+            continue;
+        };
+        while let Ok(Some(note)) = notes.next() {
+            if trim_note_name(note.name()) != b"SUI" {
+                continue;
+            }
+            if note.n_type(endian) != 0x5355_4901 {
+                continue;
+            }
+            if let Some(section_data) = parse_elf_note_desc(note.desc(), name) {
+                return Some(section_data);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn parse_elf_note_desc<'a>(desc: &'a [u8], name: &str) -> Option<&'a [u8]> {
+    if desc.len() < 2 {
+        return None;
+    }
+    let name_len = u16::from_le_bytes(desc[0..2].try_into().ok()?) as usize;
+    if desc.len() < 2 + name_len {
+        return None;
+    }
+    if desc.get(2..2 + name_len)? != name.as_bytes() {
+        return None;
+    }
+    Some(&desc[2 + name_len..])
 }
 
 #[cfg(all(unix, not(target_vendor = "apple")))]
