@@ -41,6 +41,7 @@ Extracting from self:
 use libsui::find_section;
 
 let data = find_section("hello.txt")?;
+let bytes = data.map(|v| v.as_bytes());
 ```
 
 ## Design

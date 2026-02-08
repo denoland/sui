@@ -98,6 +98,48 @@ impl From<std::io::Error> for Error {
 
 impl std::error::Error for Error {}
 
+pub struct SectionData {
+    ptr: *const u8,
+    len: usize,
+    mmap: Option<memmap2::Mmap>,
+}
+
+impl SectionData {
+    pub(crate) fn from_raw(ptr: *const u8, len: usize) -> Self {
+        Self {
+            ptr,
+            len,
+            mmap: None,
+        }
+    }
+
+    pub(crate) fn from_mmap(mmap: memmap2::Mmap, ptr: *const u8, len: usize) -> Self {
+        Self {
+            ptr,
+            len,
+            mmap: Some(mmap),
+        }
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl AsRef<[u8]> for SectionData {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
 /// A portable executable (PE)
 ///
 /// Build a new PE from existing PE and write auxillary data as
@@ -293,7 +335,7 @@ mod pe {
         FindResourceA, LoadResource, LockResource, SizeofResource,
     };
 
-    pub fn find_section(section_name: &str) -> std::io::Result<Option<&[u8]>> {
+    pub fn find_section(section_name: &str) -> std::io::Result<Option<super::SectionData>> {
         let section_name = section_name.to_uppercase();
         let section_name = CString::new(section_name)
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
@@ -316,11 +358,12 @@ mod pe {
 
             let resource_size = SizeofResource(current_process_hmod, resource_handle);
             if resource_size == 0 {
-                return Ok(Some(&[]));
+                let ptr = std::ptr::NonNull::<u8>::dangling().as_ptr();
+                return Ok(Some(super::SectionData::from_raw(ptr, 0)));
             }
 
             let resource_ptr = LockResource(resource_data);
-            Ok(Some(std::slice::from_raw_parts(
+            Ok(Some(super::SectionData::from_raw(
                 resource_ptr as *const u8,
                 resource_size as usize,
             )))
@@ -814,7 +857,7 @@ impl Macho {
 
 #[cfg(target_vendor = "apple")]
 mod macho {
-    pub fn find_section(_section_name: &str) -> std::io::Result<Option<&[u8]>> {
+    pub fn find_section(_section_name: &str) -> std::io::Result<Option<super::SectionData>> {
         #[cfg(target_arch = "x86_64")]
         {
             super::intel_mac::find_section()
@@ -854,7 +897,7 @@ mod macho {
                 // Add the "virtual memory address slide" amount to ensure a valid pointer
                 // in cases where the virtual memory address have been adjusted by the OS.
                 ptr = ptr.wrapping_add(_dyld_get_image_vmaddr_slide(0));
-                Ok(Some(std::slice::from_raw_parts(
+                Ok(Some(super::SectionData::from_raw(
                     ptr as *const u8,
                     section_size,
                 )))
@@ -874,6 +917,33 @@ fn hash(name: &str) -> u32 {
         hash = hash.wrapping_add(c as u32);
     }
     hash
+}
+
+#[cfg(all(unix, not(target_vendor = "apple")))]
+pub fn find_section_in_bytes(data: &[u8], name: &str) -> Option<&[u8]> {
+    const TRAILER_LEN: usize = 8 + 4 + 4;
+    if data.len() < TRAILER_LEN {
+        return None;
+    }
+    let tail = &data[data.len() - TRAILER_LEN..];
+    let magic = u32::from_le_bytes(tail[0..4].try_into().ok()?);
+    if magic != 0x501e {
+        return None;
+    }
+    let stored_hash = u32::from_le_bytes(tail[4..8].try_into().ok()?);
+    if stored_hash != hash(name) {
+        return None;
+    }
+    let offset = u64::from_le_bytes(tail[8..16].try_into().ok()?) as usize;
+    if offset < TRAILER_LEN || offset > data.len() {
+        return None;
+    }
+    let start = data.len() - offset;
+    let end = data.len() - TRAILER_LEN;
+    if start > end {
+        return None;
+    }
+    Some(&data[start..end])
 }
 
 impl<'a> Elf<'a> {
@@ -905,42 +975,19 @@ impl<'a> Elf<'a> {
 
 #[cfg(all(unix, not(target_vendor = "apple")))]
 mod elf {
-    use std::io::Read;
-    use std::io::Seek;
-    use std::io::SeekFrom;
-
-    pub fn find_section(name: &str) -> std::io::Result<Option<&[u8]>> {
+    pub fn find_section(name: &str) -> std::io::Result<Option<super::SectionData>> {
         let exe = std::env::current_exe()?;
-        let mut file = std::fs::File::open(exe)?;
-
-        const TRAILER_LEN: i64 = 8 + 4 + 4;
-        file.seek(SeekFrom::End(-TRAILER_LEN))?;
-        let mut buf = [0; TRAILER_LEN as usize];
-        file.read_exact(&mut buf)?;
-        let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-        if magic != 0x501e {
+        let file = std::fs::File::open(exe)?;
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        let data = &mmap[..];
+        let Some(slice) = super::find_section_in_bytes(data, name) else {
             return Ok(None);
-        }
-
-        let hash = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
-        let name_hash = super::hash(name);
-        if hash != name_hash {
-            return Ok(None);
-        }
-
-        let offset = u64::from_le_bytes([
-            buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
-        ]) as i64;
-
-        file.seek(SeekFrom::End(-offset))?;
-
-        // Read section data
-        let mut buf = Vec::new();
-        file.read_to_end(&mut buf)?;
-
-        let data = buf[..buf.len() - TRAILER_LEN as usize].to_vec();
-
-        Ok(Some(Box::leak(data.into_boxed_slice())))
+        };
+        Ok(Some(super::SectionData::from_mmap(
+            mmap,
+            slice.as_ptr(),
+            slice.len(),
+        )))
     }
 }
 
