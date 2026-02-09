@@ -1026,7 +1026,7 @@ impl<'a> Elf<'a> {
             if mem_end > seg.p_vaddr + seg.p_memsz {
                 seg.p_memsz = mem_end - seg.p_vaddr;
             }
-            if !seg.sections.iter().any(|&id| id == section_id) {
+            if !seg.sections.contains(&section_id) {
                 seg.sections.push(section_id);
             }
         }
@@ -1067,7 +1067,7 @@ impl<'a> Elf<'a> {
         let mut out = Vec::new();
         builder
             .write(&mut out)
-            .map_err(|err| Error::IoError(std::io::Error::new(std::io::ErrorKind::Other, err)))?;
+            .map_err(|err| Error::IoError(std::io::Error::other(err)))?;
         writer.write_all(&out)?;
         Ok(())
     }
