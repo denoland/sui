@@ -174,6 +174,200 @@ test_elf! {
     test_elf_1024_1024_5 : 1024 * 1024 * 5,
 }
 
+#[cfg(all(unix, not(target_vendor = "apple")))]
+#[test]
+fn test_elf_note_survives_strip() {
+    let _lock = PROCESS_LOCK.lock().unwrap();
+
+    let input = std::fs::read("tests/exec_elf64").unwrap();
+    let elf = Elf::new(&input);
+    let path = std::env::temp_dir().join("exec_elf64_strip_out");
+
+    let payload = b"hello-strip-note".to_vec();
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o755)
+        .open(&path)
+        .unwrap();
+    elf.append(RESOURCE_NAME, &payload, &mut out).unwrap();
+    drop(out);
+
+    let bytes = std::fs::read(&path).unwrap();
+    let section = find_section_in_bytes(&bytes, RESOURCE_NAME).unwrap();
+    assert_eq!(section, payload.as_slice());
+
+    let output = std::process::Command::new("strip").arg(&path).output();
+    match output {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr_lower = stderr.to_ascii_lowercase();
+            if stderr_lower.contains("unable to recognise the format")
+                || stderr_lower.contains("file format not recognized")
+            {
+                return;
+            }
+            panic!("strip failed");
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+        Err(err) => panic!("failed to run strip: {}", err),
+    }
+
+    let stripped = std::fs::read(&path).unwrap();
+    let section = find_section_in_bytes(&stripped, RESOURCE_NAME).unwrap();
+    assert_eq!(section, payload.as_slice());
+}
+
+#[cfg(all(unix, not(target_vendor = "apple")))]
+#[test]
+fn test_elf_note_mapped_and_preserves() {
+    let _lock = PROCESS_LOCK.lock().unwrap();
+
+    let input = std::fs::read("tests/exec_elf64").unwrap();
+    let elf = Elf::new(&input);
+
+    let payload = b"hello-section".to_vec();
+    let mut out = Vec::new();
+    elf.append(RESOURCE_NAME, &payload, &mut out).unwrap();
+
+    use object::endian::Endianness;
+    use object::read::elf::{ElfFile64, FileHeader, ProgramHeader, SectionHeader};
+
+    let elf_file = ElfFile64::<Endianness, _>::parse(&out[..]).unwrap();
+    let endian = elf_file.endian();
+
+    let section_table = elf_file.elf_section_table();
+    let (_, note_section) = section_table
+        .section_by_name(endian, b".note.sui")
+        .expect(".note.sui section missing");
+
+    let sh_offset: u64 = note_section.sh_offset(endian).into();
+    let sh_size: u64 = note_section.sh_size(endian).into();
+    assert!(sh_size > 0, ".note.sui is empty");
+
+    let header = elf_file.elf_header();
+    let segments = header.program_headers(endian, &out[..]).unwrap();
+
+    let mut load_covers = false;
+    let mut note_segment_matches = false;
+    for segment in segments {
+        let p_type = segment.p_type(endian);
+        let p_offset: u64 = segment.p_offset(endian).into();
+        let p_filesz: u64 = segment.p_filesz(endian).into();
+
+        if p_type == object::elf::PT_LOAD {
+            if sh_offset >= p_offset && sh_offset + sh_size <= p_offset + p_filesz {
+                load_covers = true;
+            }
+        }
+        if p_type == object::elf::PT_NOTE {
+            if sh_offset == p_offset && sh_size == p_filesz {
+                note_segment_matches = true;
+            }
+        }
+    }
+
+    assert!(load_covers, ".note.sui is not mapped by a PT_LOAD segment");
+    assert!(
+        note_segment_matches,
+        "PT_NOTE segment does not point at .note.sui"
+    );
+
+    let Ok(Some(mut notes)) = note_section.notes(endian, &out[..]) else {
+        panic!("failed to read notes from .note.sui");
+    };
+
+    let mut has_gnu = false;
+    let mut has_sui = false;
+    while let Ok(Some(note)) = notes.next() {
+        let name = trim_note_name(note.name());
+        if name == b"GNU" {
+            has_gnu = true;
+        } else if name == b"SUI" {
+            has_sui = true;
+        }
+    }
+
+    assert!(has_gnu, "expected GNU note to be preserved");
+    assert!(has_sui, "expected SUI note to be appended");
+}
+
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn find_section_in_bytes<'a>(data: &'a [u8], name: &str) -> Option<&'a [u8]> {
+    use object::endian::Endianness;
+    use object::read::elf::{ElfFile64, FileHeader, ProgramHeader, SectionHeader};
+
+    let elf_file = ElfFile64::<Endianness, _>::parse(data).ok()?;
+    let endian = elf_file.endian();
+
+    let section_table = elf_file.elf_section_table();
+    if !section_table.is_empty() {
+        for section in section_table.iter() {
+            let Ok(Some(mut notes)) = section.notes(endian, data) else {
+                continue;
+            };
+            while let Ok(Some(note)) = notes.next() {
+                if trim_note_name(note.name()) != b"SUI" {
+                    continue;
+                }
+                if note.n_type(endian) != 0x5355_4901 {
+                    continue;
+                }
+                if let Some(section_data) = parse_elf_note_desc(note.desc(), name) {
+                    return Some(section_data);
+                }
+            }
+        }
+        return None;
+    }
+
+    let header = elf_file.elf_header();
+    let segments = header.program_headers(endian, data).ok()?;
+    for segment in segments {
+        let Ok(Some(mut notes)) = segment.notes(endian, data) else {
+            continue;
+        };
+        while let Ok(Some(note)) = notes.next() {
+            if trim_note_name(note.name()) != b"SUI" {
+                continue;
+            }
+            if note.n_type(endian) != 0x5355_4901 {
+                continue;
+            }
+            if let Some(section_data) = parse_elf_note_desc(note.desc(), name) {
+                return Some(section_data);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn parse_elf_note_desc<'a>(desc: &'a [u8], name: &str) -> Option<&'a [u8]> {
+    if desc.len() < 2 {
+        return None;
+    }
+    let name_len = u16::from_le_bytes(desc[0..2].try_into().ok()?) as usize;
+    if desc.len() < 2 + name_len {
+        return None;
+    }
+    if desc.get(2..2 + name_len)? != name.as_bytes() {
+        return None;
+    }
+    Some(&desc[2 + name_len..])
+}
+
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn trim_note_name(name: &[u8]) -> &[u8] {
+    let mut end = name.len();
+    while end > 0 && name[end - 1] == 0 {
+        end -= 1;
+    }
+    &name[..end]
+}
+
 fn test_pe(size: usize) {
     let _lock = PROCESS_LOCK.lock().unwrap();
 
@@ -254,4 +448,3 @@ fn test_cross_platform_intel_mac_injection() {
     assert!(!output.is_empty());
     assert!(utils::is_macho(&output));
 }
-

@@ -51,6 +51,8 @@ use editpe::{
     ResourceData, ResourceEntry, ResourceEntryName, ResourceTable,
 };
 use image::{imageops::FilterType::Lanczos3, ImageFormat, ImageReader};
+use object::endian::Endianness;
+use object::read::elf::{FileHeader, ProgramHeader};
 use std::io::Cursor;
 use std::io::Write;
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
@@ -867,13 +869,52 @@ pub struct Elf<'a> {
     data: &'a [u8],
 }
 
-// Unsecure, makeshift hash function
-fn hash(name: &str) -> u32 {
-    let mut hash: u32 = 0;
-    for c in name.bytes() {
-        hash = hash.wrapping_add(c as u32);
+const ELF_NOTE_NAME: &[u8] = b"SUI\0";
+const ELF_NOTE_TYPE_SECTION_DATA: u32 = 0x5355_4901;
+
+fn align_up(value: usize, align: usize) -> usize {
+    if align <= 1 {
+        value
+    } else {
+        (value + (align - 1)) & !(align - 1)
     }
-    hash
+}
+
+// ELF note payload
+fn build_elf_note_payload(section_name: &str, section_data: &[u8]) -> Vec<u8> {
+    let name_len = section_name.len();
+    let name_len_u16 = u16::try_from(name_len).expect("section name too long");
+
+    let mut desc = Vec::with_capacity(2 + name_len + section_data.len());
+    desc.extend_from_slice(&name_len_u16.to_le_bytes());
+    desc.extend_from_slice(section_name.as_bytes());
+    desc.extend_from_slice(section_data);
+
+    let mut note =
+        Vec::with_capacity(12 + align_up(ELF_NOTE_NAME.len(), 4) + align_up(desc.len(), 4));
+    note.extend_from_slice(&(ELF_NOTE_NAME.len() as u32).to_le_bytes());
+    note.extend_from_slice(&(desc.len() as u32).to_le_bytes());
+    note.extend_from_slice(&ELF_NOTE_TYPE_SECTION_DATA.to_le_bytes());
+    note.extend_from_slice(ELF_NOTE_NAME);
+    note.resize(align_up(note.len(), 4), 0);
+    note.extend_from_slice(&desc);
+    note.resize(align_up(note.len(), 4), 0);
+    note
+}
+
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn parse_elf_note_desc<'a>(desc: &'a [u8], name: &str) -> Option<&'a [u8]> {
+    if desc.len() < 2 {
+        return None;
+    }
+    let name_len = u16::from_le_bytes(desc[0..2].try_into().ok()?) as usize;
+    if desc.len() < 2 + name_len {
+        return None;
+    }
+    if desc.get(2..2 + name_len)? != name.as_bytes() {
+        return None;
+    }
+    Some(&desc[2 + name_len..])
 }
 
 impl<'a> Elf<'a> {
@@ -887,60 +928,235 @@ impl<'a> Elf<'a> {
         sectdata: &[u8],
         writer: &mut W,
     ) -> Result<(), Error> {
-        let mut elf = self.data.to_vec();
-        elf.extend_from_slice(sectdata);
+        use object::build::elf as e;
+        let note_data = build_elf_note_payload(name, sectdata);
 
-        // hash the name to 4 bytes int
-        const MAGIC: u32 = 0x501e;
-        const TRAILER_LEN: u64 = 8 + 4 + 4;
+        // Existing PT_NOTE section headers are not preserved; their contents are copied into
+        // `.note.sui` instead
+        let combined_note_data = {
+            let existing = object::read::elf::ElfFile64::<Endianness, _>::parse(self.data)
+                .ok()
+                .and_then(|elf_file| {
+                    let endian = elf_file.endian();
+                    let header = elf_file.elf_header();
+                    let segments = header.program_headers(endian, self.data).ok()?;
+                    for segment in segments {
+                        if segment.p_type(endian) != object::elf::PT_NOTE {
+                            continue;
+                        }
+                        let data = segment.data(endian, self.data).ok()?;
+                        if !data.is_empty() {
+                            return Some(data);
+                        }
+                    }
+                    None
+                });
+            if let Some(existing) = existing {
+                let mut combined = Vec::with_capacity(existing.len() + note_data.len());
+                combined.extend_from_slice(existing);
+                combined.extend_from_slice(&note_data);
+                combined
+            } else {
+                note_data.clone()
+            }
+        };
 
-        elf.extend_from_slice(&MAGIC.to_le_bytes());
-        elf.extend_from_slice(&hash(name).to_le_bytes());
-        elf.extend_from_slice(&(sectdata.len() as u64 + TRAILER_LEN).to_le_bytes());
+        let mut builder =
+            e::Builder::read(self.data).map_err(|_| Error::InvalidObject("Failed to parse ELF"))?;
 
-        writer.write_all(&elf)?;
+        let section = builder.sections.add();
+        section.name = ".note.sui".into();
+        section.sh_type = object::elf::SHT_NOTE;
+        section.sh_flags = object::elf::SHF_ALLOC as u64;
+        section.sh_addralign = 4;
+        section.data = e::SectionData::Note(combined_note_data.into());
+        let section_id = section.id();
+
+        builder.set_section_sizes();
+
+        let mut max_end = 0u64;
+        for existing in builder.sections.iter() {
+            if existing.delete {
+                continue;
+            }
+            let filesz = if existing.sh_type == object::elf::SHT_NOBITS {
+                0
+            } else {
+                existing.sh_size
+            };
+            let end = existing.sh_offset + filesz;
+            if end > max_end {
+                max_end = end;
+            }
+        }
+        let load_segment_id = builder
+            .segments
+            .iter()
+            .filter(|segment| segment.is_load())
+            .max_by_key(|segment| segment.p_offset + segment.p_filesz)
+            .map(|segment| segment.id());
+
+        {
+            let section = builder.sections.get_mut(section_id);
+            let align = if let Some(load_segment_id) = load_segment_id {
+                let seg = builder.segments.get(load_segment_id);
+                (seg.p_align as usize)
+                    .max(section.sh_addralign as usize)
+                    .max(1)
+            } else {
+                (section.sh_addralign as usize).max(1)
+            };
+            section.sh_offset = align_up(max_end as usize, align) as u64;
+            section.sh_addr = if let Some(load_segment_id) = load_segment_id {
+                let seg = builder.segments.get(load_segment_id);
+                seg.p_vaddr + (section.sh_offset - seg.p_offset)
+            } else {
+                0
+            };
+        }
+
+        if let Some(load_segment_id) = load_segment_id {
+            let section = builder.sections.get_mut(section_id);
+            let seg = builder.segments.get_mut(load_segment_id);
+            let section_end = section.sh_offset + section.sh_size;
+            let mem_end = section.sh_addr + section.sh_size;
+            if section_end > seg.p_offset + seg.p_filesz {
+                seg.p_filesz = section_end - seg.p_offset;
+            }
+            if mem_end > seg.p_vaddr + seg.p_memsz {
+                seg.p_memsz = mem_end - seg.p_vaddr;
+            }
+            if !seg.sections.contains(&section_id) {
+                seg.sections.push(section_id);
+            }
+        }
+
+        let note_segment_id = builder
+            .segments
+            .iter()
+            .find(|segment| segment.p_type == object::elf::PT_NOTE)
+            .map(|segment| segment.id());
+
+        if let Some(note_segment_id) = note_segment_id {
+            let section = builder.sections.get_mut(section_id);
+            let segment = builder.segments.get_mut(note_segment_id);
+            segment.sections.clear();
+            segment.sections.push(section_id);
+            segment.p_type = object::elf::PT_NOTE;
+            segment.p_flags = object::elf::PF_R;
+            segment.p_align = 4;
+            segment.p_offset = section.sh_offset;
+            segment.p_vaddr = section.sh_addr;
+            segment.p_paddr = section.sh_addr;
+            segment.p_filesz = section.sh_size;
+            segment.p_memsz = section.sh_size;
+        } else {
+            let section = builder.sections.get_mut(section_id);
+            let segment = builder.segments.add();
+            segment.p_type = object::elf::PT_NOTE;
+            segment.p_flags = object::elf::PF_R;
+            segment.p_align = 4;
+            segment.p_offset = section.sh_offset;
+            segment.p_vaddr = section.sh_addr;
+            segment.p_paddr = section.sh_addr;
+            segment.p_filesz = section.sh_size;
+            segment.p_memsz = section.sh_size;
+            segment.sections.push(section_id);
+        }
+
+        let mut out = Vec::new();
+        builder
+            .write(&mut out)
+            .map_err(|err| Error::IoError(std::io::Error::other(err)))?;
+        writer.write_all(&out)?;
         Ok(())
     }
 }
 
 #[cfg(all(unix, not(target_vendor = "apple")))]
 mod elf {
-    use std::io::Read;
-    use std::io::Seek;
-    use std::io::SeekFrom;
+    use libc::{dl_iterate_phdr, dl_phdr_info, Elf64_Phdr, PT_NOTE};
+    use std::os::raw::{c_int, c_void};
+
+    unsafe extern "C" fn sui_dl_iterate_phdr_callback(
+        info: *mut dl_phdr_info,
+        _size: usize,
+        data: *mut c_void,
+    ) -> c_int {
+        *(data as *mut dl_phdr_info) = *info;
+        1
+    }
+
+    fn find_in_note_segment<'a>(segment: &'a [u8], align: usize, name: &str) -> Option<&'a [u8]> {
+        let mut pos = 0usize;
+        while pos + 12 <= segment.len() {
+            let namesz = u32::from_le_bytes(segment[pos..pos + 4].try_into().ok()?) as usize;
+            let descsz = u32::from_le_bytes(segment[pos + 4..pos + 8].try_into().ok()?) as usize;
+            let note_type = u32::from_le_bytes(segment[pos + 8..pos + 12].try_into().ok()?);
+            pos += 12;
+
+            if pos + namesz > segment.len() {
+                break;
+            }
+            let mut note_name = &segment[pos..pos + namesz];
+            while let [rest @ .., 0] = note_name {
+                note_name = rest;
+            }
+            pos = super::align_up(pos + namesz, align);
+
+            if pos + descsz > segment.len() {
+                break;
+            }
+            let desc = &segment[pos..pos + descsz];
+            pos = super::align_up(pos + descsz, align);
+
+            if note_name == &super::ELF_NOTE_NAME[..super::ELF_NOTE_NAME.len() - 1]
+                && note_type == super::ELF_NOTE_TYPE_SECTION_DATA
+            {
+                if let Some(section_data) = super::parse_elf_note_desc(desc, name) {
+                    return Some(section_data);
+                }
+            }
+        }
+        None
+    }
 
     pub fn find_section(name: &str) -> std::io::Result<Option<&[u8]>> {
-        let exe = std::env::current_exe()?;
-        let mut file = std::fs::File::open(exe)?;
-
-        const TRAILER_LEN: i64 = 8 + 4 + 4;
-        file.seek(SeekFrom::End(-TRAILER_LEN))?;
-        let mut buf = [0; TRAILER_LEN as usize];
-        file.read_exact(&mut buf)?;
-        let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-        if magic != 0x501e {
-            return Ok(None);
+        let mut main_program_info: dl_phdr_info = unsafe { std::mem::zeroed() };
+        unsafe {
+            dl_iterate_phdr(
+                Some(sui_dl_iterate_phdr_callback),
+                &mut main_program_info as *mut dl_phdr_info as *mut c_void,
+            );
         }
 
-        let hash = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
-        let name_hash = super::hash(name);
-        if hash != name_hash {
-            return Ok(None);
+        let mut p = main_program_info.dlpi_phdr as *const u8;
+        let mut n = main_program_info.dlpi_phnum as usize;
+        let base = main_program_info.dlpi_addr as usize;
+
+        while n > 0 {
+            let phdr = unsafe { &*(p as *const Elf64_Phdr) };
+            if phdr.p_type == PT_NOTE {
+                let pos = base + phdr.p_vaddr as usize;
+                let len = phdr.p_memsz as usize;
+                if len > 0 {
+                    let segment = unsafe { std::slice::from_raw_parts(pos as *const u8, len) };
+                    let align = (phdr.p_align as usize).max(4);
+                    if let Some(section_data) = find_in_note_segment(segment, align, name) {
+                        // SAFETY: `segment` points into a mapped PT_LOAD range of the main
+                        // executable. That mapping stays valid for the process lifetime,
+                        // so it is safe to extend the slice's lifetime to 'static here.
+                        let data: &'static [u8] = unsafe { std::mem::transmute(section_data) };
+                        return Ok(Some(data));
+                    }
+                }
+            }
+
+            n -= 1;
+            p = unsafe { p.add(core::mem::size_of::<Elf64_Phdr>()) };
         }
 
-        let offset = u64::from_le_bytes([
-            buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
-        ]) as i64;
-
-        file.seek(SeekFrom::End(-offset))?;
-
-        // Read section data
-        let mut buf = Vec::new();
-        file.read_to_end(&mut buf)?;
-
-        let data = buf[..buf.len() - TRAILER_LEN as usize].to_vec();
-
-        Ok(Some(Box::leak(data.into_boxed_slice())))
+        Ok(None)
     }
 }
 
