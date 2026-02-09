@@ -51,10 +51,8 @@ use editpe::{
     ResourceData, ResourceEntry, ResourceEntryName, ResourceTable,
 };
 use image::{imageops::FilterType::Lanczos3, ImageFormat, ImageReader};
-#[cfg(all(unix, not(target_vendor = "apple")))]
 use object::endian::Endianness;
-#[cfg(all(unix, not(target_vendor = "apple")))]
-use object::read::elf::{FileHeader, ProgramHeader, SectionHeader};
+use object::read::elf::{FileHeader, ProgramHeader};
 use std::io::Cursor;
 use std::io::Write;
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
@@ -882,9 +880,7 @@ fn align_up(value: usize, align: usize) -> usize {
     }
 }
 
-// ELF note payload layout:
-// [namesz:u32][descsz:u32][type:u32][name bytes]["SUI\\0" padded to 4]
-// [desc bytes][u16 name_len][name][section_data][desc padded to 4]
+// ELF note payload
 fn build_elf_note_payload(section_name: &str, section_data: &[u8]) -> Vec<u8> {
     let name_len = section_name.len();
     let name_len_u16 = u16::try_from(name_len).expect("section name too long");
@@ -934,6 +930,9 @@ impl<'a> Elf<'a> {
     ) -> Result<(), Error> {
         use object::build::elf as e;
         let note_data = build_elf_note_payload(name, sectdata);
+
+        // Existing PT_NOTE section headers are not preserved; their contents are copied into
+        // `.note.sui` instead
         let combined_note_data = {
             let existing = object::read::elf::ElfFile64::<Endianness, _>::parse(self.data)
                 .ok()
