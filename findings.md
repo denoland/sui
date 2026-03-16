@@ -166,3 +166,200 @@ If an application calls `find_section` repeatedly in a loop (processing multiple
 **Fix Suggestion:**
 Document this behavior or provide a non-leaking alternative API that returns owned data.
 
+
+---
+
+## Finding 5: Integer Overflow in find_in_note_segment
+
+**Severity:** MEDIUM
+
+**Location:** `lib.rs:1097, lib.rs:1105-1108`
+
+**Description:**
+The `find_in_note_segment` function reads `namesz` and `descsz` from untrusted ELF note data and uses them in bounds checks that can overflow:
+
+```rust
+fn find_in_note_segment<'a>(segment: &'a [u8], align: usize, name: &str) -> Option<&'a [u8]> {
+    let mut pos = 0usize;
+    while pos + 12 <= segment.len() {
+        let namesz = u32::from_le_bytes(segment[pos..pos + 4].try_into().ok()?) as usize;
+        let descsz = u32::from_le_bytes(segment[pos + 4..pos + 8].try_into().ok()?) as usize;
+        // ...
+        pos += 12;
+
+        if pos + namesz > segment.len() {  // Can overflow!
+            break;
+        }
+        // ...
+        if pos + descsz > segment.len() {  // Can overflow!
+            break;
+        }
+        let desc = &segment[pos..pos + descsz];  // Out-of-bounds access!
+```
+
+On 64-bit systems with `usize = u64`, the `namesz` value can be up to 4GB (u32::MAX). If `pos = 12` and `namesz = 0xFFFF_FFF0`, then `pos + namesz = 0x100000002` which wraps to `2` due to integer overflow (though u32 fits in u64 so this requires specific conditions).
+
+On 32-bit systems, if `pos = 12` and `namesz = 0xFFFF_FFF4`, then `pos + namesz` wraps to `0`, bypassing the bounds check and leading to out-of-bounds reads.
+
+**Proof/Exploit:**
+Craft a malicious ELF binary with:
+1. A PT_NOTE segment
+2. Inside that segment, a note entry with:
+   - `namesz = 0xFFFF_FFF4` (on 32-bit) or similar large value
+   - This causes the bounds check `pos + namesz > segment.len()` to be bypassed via overflow
+
+The subsequent slicing `&segment[pos..pos + namesz]` will then panic or access out-of-bounds memory.
+
+**Fix Suggestion:**
+Use checked arithmetic:
+```rust
+if namesz > segment.len().saturating_sub(pos) {
+    break;
+}
+```
+Or use the `checked_add` method:
+```rust
+if pos.checked_add(namesz).map_or(true, |end| end > segment.len()) {
+    break;
+}
+```
+
+---
+
+## Finding 6: Integer Overflow in align_up Function
+
+**Severity:** MEDIUM
+
+**Location:** `lib.rs:875-881, lib.rs:1105, lib.rs:1109`
+
+**Description:**
+The `align_up` function performs unchecked arithmetic that can overflow:
+
+```rust
+fn align_up(value: usize, align: usize) -> usize {
+    if align <= 1 {
+        value
+    } else {
+        (value + (align - 1)) & !(align - 1)
+    }
+}
+```
+
+If `value` is close to `usize::MAX`, the addition `value + (align - 1)` will overflow, wrapping around to a small value.
+
+This is called from `find_in_note_segment`:
+```rust
+pos = super::align_up(pos + namesz, align);
+// ...
+pos = super::align_up(pos + descsz, align);
+```
+
+And from the ELF building code:
+```rust
+section.sh_offset = align_up(max_end as usize, align) as u64;
+```
+
+**Proof/Exploit:**
+In the ELF parsing/writing path:
+1. A malformed ELF file with `sh_offset` and `sh_size` values that sum to near `usize::MAX`
+2. When `align_up` is called, it overflows
+3. The resulting small offset causes incorrect file layout or memory access
+
+In the note segment parsing path (`find_in_note_segment`):
+1. `namesz` or `descsz` values near `usize::MAX - pos`
+2. After `align_up`, the `pos` wraps around to a small value
+3. The loop continues with an invalid `pos`, potentially reading beyond segment bounds
+
+**Fix Suggestion:**
+Use checked or saturating arithmetic:
+```rust
+fn align_up(value: usize, align: usize) -> Option<usize> {
+    if align <= 1 {
+        Some(value)
+    } else {
+        value.checked_add(align - 1).map(|v| v & !(align - 1))
+    }
+}
+```
+
+---
+
+## Finding 7: Integer Overflow in c_dir_sz Calculation (MachoSigner)
+
+**Severity:** MEDIUM
+
+**Location:** `apple_codesign.rs:171`
+
+**Description:**
+In the `MachoSigner::sign` function, the calculation of `c_dir_sz` can overflow:
+
+```rust
+let n_hashes = self.sig_off.div_ceil(PAGE_SIZE);
+let id_off = size_of::<CodeDirectory>();
+let hash_off = id_off + id.len();
+let c_dir_sz = hash_off + n_hashes * 32;  // Potential overflow!
+let sz = size_of::<SuperBlob>() + size_of::<Blob>() + c_dir_sz;
+```
+
+If `self.sig_off` is large (close to `usize::MAX`), `n_hashes` will be a large value. The multiplication `n_hashes * 32` can then overflow, wrapping to a small value.
+
+For example, on a 64-bit system:
+- `sig_off = 0xFFFF_FFFF_FFFF_F000` (a large valid file offset)
+- `n_hashes = sig_off.div_ceil(4096) ≈ 0x000F_FFFF_FFFF_FFFF`  
+- `n_hashes * 32 ≈ 0x1FFF_FFFF_FFFF_FFE0` which overflows to a negative-looking value or wraps
+
+This would result in:
+- Incorrect `sz` calculation
+- Incorrect buffer allocation with `Vec::with_capacity(sz)`
+- Potential out-of-bounds writes when filling the buffer
+
+**Proof/Exploit:**
+1. Create a Mach-O file with an extremely large (but technically valid) signature offset
+2. Pass it to `MachoSigner::new()` followed by `sign()`
+3. The integer overflow causes incorrect sizing
+4. Buffer operations may panic or access invalid memory
+
+**Fix Suggestion:**
+Use checked arithmetic:
+```rust
+let c_dir_sz = n_hashes
+    .checked_mul(32)
+    .and_then(|v| v.checked_add(hash_off))
+    .ok_or(Error::InvalidObject("Size calculation overflow"))?;
+```
+
+---
+
+## Finding 8: Integer Underflow in seg_sz Calculation (MachoSigner)
+
+**Severity:** MEDIUM
+
+**Location:** `apple_codesign.rs:181`
+
+**Description:**
+In the `MachoSigner::sign` function, the calculation of `seg_sz` can underflow:
+
+```rust
+let seg_sz = self.sig_off + sz - self.linkedit_seg.fileoff as usize;
+```
+
+If `self.linkedit_seg.fileoff` is greater than `self.sig_off + sz`, the subtraction will underflow, resulting in an extremely large value.
+
+The `linkedit_seg.fileoff` comes from parsing the Mach-O file, and while a well-formed file should have valid relationships between these values, a malformed or malicious file could violate these invariants.
+
+**Proof/Exploit:**
+1. Craft a malicious Mach-O file with:
+   - `linkedit_seg.fileoff = 0x8000_0000_0000_0000` (large value)
+   - `sig_off + sz = 0x1000` (small value)
+2. When `sign()` is called:
+   - `seg_sz = 0x1000 - 0x8000_0000_0000_0000` underflows to a huge value
+3. `linkedit_seg.filesize = seg_sz as u64;` sets an invalid file size
+4. This corrupts the output binary structure
+
+**Fix Suggestion:**
+Use checked arithmetic:
+```rust
+let seg_sz = (self.sig_off + sz)
+    .checked_sub(self.linkedit_seg.fileoff as usize)
+    .ok_or(Error::InvalidObject("Invalid linkedit segment layout"))?;
+```
