@@ -363,3 +363,147 @@ let seg_sz = (self.sig_off + sz)
     .checked_sub(self.linkedit_seg.fileoff as usize)
     .ok_or(Error::InvalidObject("Invalid linkedit segment layout"))?;
 ```
+
+---
+
+## Finding 9: Integer Overflow in roundup Function (experiment.rs)
+
+**Severity:** MEDIUM
+
+**Location:** `experiment.rs:29-31`
+
+**Description:**
+The `roundup` function performs unchecked multiplication and addition that can overflow:
+
+```rust
+fn roundup(x: usize, y: usize) -> usize {
+    ((x + y - 1) / y) * y
+}
+```
+
+If `x + y - 1` overflows, it wraps around and the result can be incorrect. Similarly, the final multiplication `(...) * y` can overflow.
+
+This is called with potentially attacker-controlled values from ELF note sections:
+```rust
+pos += size_of::<Elf64_Nhdr>()
+    + roundup((*note).n_namesz as usize, 4)
+    + roundup((*note).n_descsz as usize, 4);
+```
+
+**Proof/Exploit:**
+If a malicious ELF note has `n_namesz = 0xFFFFFFFC` on a 32-bit system:
+- `roundup(0xFFFFFFFC, 4) = ((0xFFFFFFFC + 3) / 4) * 4 = ((0xFFFFFFFF) / 4) * 4 = 0x3FFFFFFF * 4 = 0xFFFFFFFC`
+- But `0xFFFFFFFC + 4 = 0` (wrap), causing incorrect memory access
+
+Combined with unsafe pointer operations in `find_section2`, this can lead to out-of-bounds reads.
+
+**Fix Suggestion:**
+Use checked arithmetic:
+```rust
+fn roundup_checked(x: usize, y: usize) -> Option<usize> {
+    x.checked_add(y.checked_sub(1)?)
+        .and_then(|v| v.checked_div(y))
+        .and_then(|v| v.checked_mul(y))
+}
+```
+
+---
+
+## Finding 10: Unsafe Memory Access in find_section2
+
+**Severity:** HIGH
+
+**Location:** `experiment.rs:78-93`
+
+**Description:**
+The `find_section2` function performs unsafe memory reads based on untrusted values from ELF note headers without proper bounds checking:
+
+```rust
+let note = pos as *const Elf64_Nhdr;
+if (*note).n_namesz != 0
+    && (*note).n_descsz != 0
+    && strncmp(
+        (pos + size_of::<Elf64_Nhdr>()) as *const c_char,  // No bounds check!
+        elf_section_name.as_ptr() as *const c_char,
+        elf_section_name.len(),
+    ) == 0
+{
+    let size = (*note).n_descsz as usize;
+    let data = pos + size_of::<Elf64_Nhdr>() + roundup((*note).n_namesz as usize, 4);
+    return Some(std::slice::from_raw_parts(data as *const u8, size));  // OOB read!
+}
+```
+
+Several issues:
+1. `strncmp` reads from `pos + size_of::<Elf64_Nhdr>()` without verifying the name fits within the segment bounds
+2. `data` is calculated from `n_namesz` which could be any u32 value, potentially pointing outside valid memory
+3. `std::slice::from_raw_parts` creates a slice of `size` bytes (derived from `n_descsz`) which could be arbitrary
+
+**Proof/Exploit:**
+A crafted binary with:
+- A PT_NOTE segment
+- A note with `n_namesz = 0` (passes the `!= 0` check) but actually has no name data
+- `n_descsz = 0x10000000` (256MB)
+
+This would cause `std::slice::from_raw_parts` to create a slice potentially reading far beyond allocated memory, leading to information disclosure or crash.
+
+**Fix Suggestion:**
+Add bounds checks before all unsafe memory operations:
+```rust
+let name_end = pos.checked_add(size_of::<Elf64_Nhdr>())
+    .and_then(|v| v.checked_add((*note).n_namesz as usize));
+let desc_end = name_end
+    .and_then(|v| v.checked_add(roundup_checked((*note).n_namesz as usize, 4)?))
+    .and_then(|v| v.checked_add((*note).n_descsz as usize));
+
+if desc_end.is_none() || desc_end.unwrap() > end {
+    break;  // Invalid note structure
+}
+```
+
+---
+
+## Finding 5: Out-of-Bounds Read in find_section2 due to Unchecked Arithmetic
+
+**Severity:** HIGH
+
+**Location:** `experiment.rs:69-90`
+
+**Description:**
+The `find_section2` function performs multiple arithmetic operations without bounds checking when calculating memory offsets for note sections. Several vulnerabilities exist:
+
+1. The calculation `pos = base + (*phdr).p_vaddr as usize` at line 69 can overflow if a malicious ELF binary has a very large p_vaddr value.
+
+2. The calculation `end = pos + (*phdr).p_memsz as usize` at line 70 can overflow.
+
+3. At line 89, the data offset calculation has no bounds check:
+```rust
+let data = pos + size_of::<Elf64_Nhdr>() + roundup((*note).n_namesz as usize, 4);
+```
+This can overflow and result in reading memory from an unintended location.
+
+4. At line 90, `std::slice::from_raw_parts(data as *const u8, size)` is called without validating that `data + size <= end`, leading to potential out-of-bounds memory access.
+
+**Proof/Exploit:**
+A crafted ELF binary with a PT_NOTE segment could set:
+- `p_vaddr` + `p_memsz` to overflow, making `end < pos`
+- `n_namesz` to a value that when added to `pos + size_of::<Elf64_Nhdr>()` overflows, wrapping around to point to arbitrary memory
+
+When the process runs the affected binary and calls `find_section2()`, it will:
+1. Create a slice pointing to arbitrary memory locations
+2. Return this slice to the caller, potentially leaking sensitive data
+
+**Fix Suggestion:**
+Add bounds checking for all arithmetic operations:
+```rust
+let pos = base.checked_add((*phdr).p_vaddr as usize)?;
+let end = pos.checked_add((*phdr).p_memsz as usize)?;
+// ...
+let name_aligned = roundup((*note).n_namesz as usize, 4);
+let data = pos.checked_add(size_of::<Elf64_Nhdr>())?.checked_add(name_aligned)?;
+let size = (*note).n_descsz as usize;
+if data.checked_add(size)? > end {
+    break; // Invalid note
+}
+return Some(std::slice::from_raw_parts(data as *const u8, size));
+```
