@@ -206,8 +206,15 @@ pub fn patch_macho_executable(file: &mut [u8]) -> bool {
         let cmd_type = read_u32_le(file, offset);
         offset += 4;
 
-        let size = read_u32_le(file, offset) as usize - 8;
+        let cmdsize = read_u32_le(file, offset) as usize;
         offset += 4;
+
+        // cmdsize must be at least 8 (for cmd and cmdsize fields themselves)
+        // to avoid integer underflow when calculating the remaining size
+        if cmdsize < 8 {
+            return false;
+        }
+        let size = cmdsize - 8;
 
         if offset + size > file.len() {
             return false;
@@ -267,6 +274,34 @@ mod tests {
     #[test]
     fn test_patch_macho_executable_invalid() {
         let mut buf = vec![0u8; 10];
+        assert_eq!(patch_macho_executable(&mut buf), false);
+    }
+
+    #[test]
+    fn test_patch_macho_executable_cmdsize_underflow() {
+        // Regression test for integer underflow vulnerability.
+        // A malformed Mach-O with cmdsize < 8 would cause an underflow
+        // when calculating `size = cmdsize - 8`.
+        let mut buf = vec![0u8; 64];
+        // Set ncmds = 1 at offset 16
+        write_u32_le(&mut buf, 16, 1);
+        // At offset 32 (HSIZE), set cmd_type (doesn't matter for this test)
+        write_u32_le(&mut buf, 32, 0);
+        // At offset 36, set cmdsize = 4 (less than 8, should trigger underflow protection)
+        write_u32_le(&mut buf, 36, 4);
+        
+        // This should return false instead of causing an underflow
+        assert_eq!(patch_macho_executable(&mut buf), false);
+    }
+
+    #[test]
+    fn test_patch_macho_executable_cmdsize_zero() {
+        // Test with cmdsize = 0 (worst case for underflow)
+        let mut buf = vec![0u8; 64];
+        write_u32_le(&mut buf, 16, 1); // ncmds = 1
+        write_u32_le(&mut buf, 32, 0); // cmd_type
+        write_u32_le(&mut buf, 36, 0); // cmdsize = 0
+        
         assert_eq!(patch_macho_executable(&mut buf), false);
     }
 }
