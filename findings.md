@@ -463,7 +463,7 @@ if desc_end.is_none() || desc_end.unwrap() > end {
 
 ---
 
-## Finding 5: Out-of-Bounds Read in find_section2 due to Unchecked Arithmetic
+## Finding 11: Out-of-Bounds Read in find_section2 due to Unchecked Arithmetic
 
 **Severity:** HIGH
 
@@ -506,4 +506,143 @@ if data.checked_add(size)? > end {
     break; // Invalid note
 }
 return Some(std::slice::from_raw_parts(data as *const u8, size));
+```
+
+---
+
+## Finding 5: Integer Overflow in MachoSigner::sign via Large sig_off
+
+**Severity:** MEDIUM
+
+**Location:** `apple_codesign.rs:168-181`
+
+**Description:**
+In the `MachoSigner::sign` function, the number of hashes `n_hashes` is calculated based on `sig_off` which comes from untrusted input (a file). If `sig_off` is very large (close to `usize::MAX`), the subsequent multiplication `n_hashes * 32` can overflow on 64-bit platforms.
+
+```rust
+let n_hashes = self.sig_off.div_ceil(PAGE_SIZE);  // n_hashes can be huge
+let id_off = size_of::<CodeDirectory>();
+let hash_off = id_off + id.len();
+let c_dir_sz = hash_off + n_hashes * 32;  // OVERFLOW: n_hashes * 32 can wrap
+let sz = size_of::<SuperBlob>() + size_of::<Blob>() + c_dir_sz;
+```
+
+**Proof/Exploit:**
+A malicious Mach-O file can be crafted with:
+1. A valid Mach-O structure
+2. An `LC_CODE_SIGNATURE` load command with `dataoff` set to a very large value (e.g., `0x7FFFFFFFFFFFFFF8`)
+
+On a 64-bit system:
+- `n_hashes = 0x7FFFFFFFFFFFFFF8 / 4096 = 0x1FFFFFFFFFFFFF` (huge number)
+- `n_hashes * 32` would overflow, wrapping to a small value
+- This leads to an undersized buffer allocation
+- Subsequent hash writes would corrupt memory or panic
+
+Additionally, at line 181:
+```rust
+let seg_sz = self.sig_off + sz - self.linkedit_seg.fileoff as usize;
+```
+If `self.sig_off + sz` overflows, this calculation produces incorrect results.
+
+**Fix Suggestion:**
+Add overflow checks:
+```rust
+let n_hashes = self.sig_off.div_ceil(PAGE_SIZE);
+let c_dir_sz = n_hashes.checked_mul(32)
+    .and_then(|v| v.checked_add(hash_off))
+    .ok_or(Error::InvalidObject("Code signature size overflow"))?;
+```
+
+---
+
+## Finding 6: Potential Memory Corruption via Unchecked Slice Access in find_in_note_segment
+
+**Severity:** MEDIUM
+
+**Location:** `lib.rs:1090-1112`
+
+**Description:**
+In `find_in_note_segment`, the function reads `namesz` and `descsz` from untrusted input and uses them to compute positions. While there are bounds checks, the arithmetic `pos + namesz` could overflow before the comparison:
+
+```rust
+let namesz = u32::from_le_bytes(segment[pos..pos + 4].try_into().ok()?) as usize;
+let descsz = u32::from_le_bytes(segment[pos + 4..pos + 8].try_into().ok()?) as usize;
+// ...
+pos += 12;
+
+if pos + namesz > segment.len() {  // Could overflow if namesz is huge
+    break;
+}
+```
+
+On 64-bit platforms with a 32-bit `namesz` cast to `usize`, this isn't immediately exploitable. However, the pattern is still concerning for:
+1. 32-bit platforms where `usize` is 32 bits
+2. Future code changes
+
+Additionally:
+```rust
+pos = super::align_up(pos + namesz, align);  // Could overflow
+if pos + descsz > segment.len() {            // Second overflow potential
+    break;
+}
+```
+
+**Proof/Exploit:**
+On a 32-bit system, or with carefully crafted inputs:
+- If `namesz = 0xFFFFFFFF` and `pos = 12`, then `pos + namesz = 0x10000000B` which wraps to `0xB` (11)
+- The bounds check `pos + namesz > segment.len()` would then pass incorrectly
+- Subsequent slice access could read out-of-bounds memory
+
+**Fix Suggestion:**
+Use checked arithmetic:
+```rust
+let next_pos = pos.checked_add(namesz).ok_or_else(|| ...)?;
+if next_pos > segment.len() {
+    break;
+}
+```
+
+---
+
+## Finding 7: Integer Underflow in MachoSigner::sign seg_sz Calculation
+
+**Severity:** MEDIUM
+
+**Location:** `apple_codesign.rs:181`
+
+**Description:**
+The calculation of `seg_sz` can underflow if `linkedit_seg.fileoff` is greater than `sig_off + sz`:
+
+```rust
+let seg_sz = self.sig_off + sz - self.linkedit_seg.fileoff as usize;
+```
+
+Since `linkedit_seg.fileoff` comes from parsing the input file without validation that it's less than `sig_off`, this subtraction can underflow.
+
+**Proof/Exploit:**
+A malicious Mach-O file with:
+- `linkedit_seg.fileoff = 0x10000`
+- `sig_off = 0x100`
+- `sz = 0x50`
+
+Would result in:
+- `seg_sz = 0x150 - 0x10000` = underflow to huge value
+
+This would then be written to:
+```rust
+linkedit_seg.filesize = seg_sz as u64;
+linkedit_seg.vmsize = seg_sz as u64;
+```
+
+Creating a malformed binary or causing memory allocation issues.
+
+**Fix Suggestion:**
+Validate the relationship before subtraction:
+```rust
+let total = self.sig_off.checked_add(sz)
+    .ok_or(Error::InvalidObject("size overflow"))?;
+if total < self.linkedit_seg.fileoff as usize {
+    return Err(Error::InvalidObject("Invalid linkedit segment offset"));
+}
+let seg_sz = total - self.linkedit_seg.fileoff as usize;
 ```
