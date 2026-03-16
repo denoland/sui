@@ -213,3 +213,124 @@ pub fn write_section(mut self, name: &str, sectdata: Vec<u8>) -> Result<Self, Er
     // ... rest of function
 }
 ```
+
+---
+
+## Finding 6: Integer Underflow in MachoSigner::sign (seg_sz calculation)
+
+**Severity:** MEDIUM
+
+**Location:** `apple_codesign.rs:181`
+
+**Description:**
+In the `MachoSigner::sign` function, there's a subtraction that can underflow:
+
+```rust
+let seg_sz = self.sig_off + sz - self.linkedit_seg.fileoff as usize;
+```
+
+The `linkedit_seg.fileoff` is read directly from untrusted input (the Mach-O file being signed). If a crafted Mach-O file has a `__LINKEDIT` segment with `fileoff` greater than `sig_off + sz`, this subtraction will underflow, resulting in a very large value being written to `linkedit_seg.filesize` and `linkedit_seg.vmsize`.
+
+**Proof/Exploit:**
+A malformed Mach-O binary can be crafted with:
+1. A `__LINKEDIT` segment with `fileoff` set to a very large value (e.g., 0xFFFFFFFF)
+2. A valid `LC_CODE_SIGNATURE` command with a small `dataoff` value
+
+When `MachoSigner::sign` processes this:
+```rust
+let seg_sz = self.sig_off + sz - self.linkedit_seg.fileoff as usize;
+// With sig_off=1000, sz=500, fileoff=0xFFFFFFFF:
+// seg_sz = 1000 + 500 - 4294967295 = wraps to very large number
+
+linkedit_seg.filesize = seg_sz as u64;  // Very large value written
+linkedit_seg.vmsize = seg_sz as u64;    // Very large value written
+```
+
+In debug builds this will panic; in release builds it produces a corrupted binary with invalid segment sizes, which could lead to:
+- Denial of service through crash when loading the corrupted binary
+- Potential exploitation if the corrupted binary is later processed
+
+**Fix Suggestion:**
+Add bounds checking before the subtraction:
+```rust
+let total_size = self.sig_off + sz;
+if self.linkedit_seg.fileoff as usize > total_size {
+    return Err(Error::InvalidObject("Invalid LINKEDIT fileoff"));
+}
+let seg_sz = total_size - self.linkedit_seg.fileoff as usize;
+```
+
+---
+
+## Finding 7: Out-of-Bounds Read in experiment::find_section2
+
+**Severity:** HIGH
+
+**Location:** `experiment.rs:80-86`
+
+**Description:**
+In the `find_section2` function, there's a bounds check at line 75 that ensures `pos + size_of::<Elf64_Nhdr>()` doesn't exceed `end`. However, immediately after reading the `Elf64_Nhdr`, the code performs a `strncmp` on memory at `pos + size_of::<Elf64_Nhdr>()` without verifying that this memory plus the note name size is within bounds:
+
+```rust
+if pos + size_of::<Elf64_Nhdr>() > end {
+    break; // invalid
+}
+
+let note = pos as *const Elf64_Nhdr;
+if (*note).n_namesz != 0
+    && (*note).n_descsz != 0
+    && strncmp(
+        (pos + size_of::<Elf64_Nhdr>()) as *const c_char,  // No bounds check!
+        elf_section_name.as_ptr() as *const c_char,
+        elf_section_name.len(),
+    ) == 0
+{
+    let size = (*note).n_descsz as usize;
+    let data =
+        pos + size_of::<Elf64_Nhdr>() + roundup((*note).n_namesz as usize, 4);  // No bounds check!
+    return Some(std::slice::from_raw_parts(data as *const u8, size));  // Potential OOB
+}
+```
+
+The `n_namesz` and `n_descsz` fields are read from untrusted ELF data. If a malformed ELF file has very large values for these fields, the code will:
+1. Call `strncmp` on memory beyond the segment bounds
+2. Calculate a `data` pointer beyond segment bounds  
+3. Return a slice that extends beyond valid memory
+
+**Proof/Exploit:**
+A malformed ELF binary with a PT_NOTE segment can be crafted where:
+1. The segment has a small `p_memsz` (e.g., 16 bytes)
+2. The note header has `n_namesz` = 0xFFFFFFFF and `n_descsz` = 0xFFFFFFFF
+
+When `find_section2` processes this:
+- The check `pos + size_of::<Elf64_Nhdr>() > end` passes (12 + 4 = 16 <= 16)
+- But `roundup(n_namesz, 4)` = very large number
+- `data = pos + 12 + huge_number` = memory far beyond segment
+- `std::slice::from_raw_parts(data, n_descsz)` creates a slice pointing to arbitrary memory
+
+This is an out-of-bounds read vulnerability that could:
+- Leak sensitive memory contents
+- Cause crashes/segfaults
+- Potentially be exploited for further attacks
+
+**Fix Suggestion:**
+Add comprehensive bounds checking:
+```rust
+let note = pos as *const Elf64_Nhdr;
+let namesz = (*note).n_namesz as usize;
+let descsz = (*note).n_descsz as usize;
+
+// Validate that name and data fit within segment
+let name_start = pos + size_of::<Elf64_Nhdr>();
+let name_padded = roundup(namesz, 4);
+let data_start = name_start + name_padded;
+let data_padded = roundup(descsz, 4);
+
+if data_start + data_padded > end {
+    // Note extends beyond segment bounds
+    pos += size_of::<Elf64_Nhdr>() + name_padded + data_padded;
+    continue;  // or break
+}
+
+// Now safe to access name and data
+```
