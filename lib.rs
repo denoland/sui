@@ -62,8 +62,12 @@ pub mod intel_mac;
 
 #[cfg(all(unix, not(target_vendor = "apple")))]
 pub use elf::find_section;
+#[cfg(all(unix, not(target_vendor = "apple")))]
+pub use elf::find_section_in_current_image;
 #[cfg(target_vendor = "apple")]
 pub use macho::find_section;
+#[cfg(target_vendor = "apple")]
+pub use macho::find_section_in_current_image;
 #[cfg(windows)]
 pub use pe::find_section;
 
@@ -863,6 +867,91 @@ mod macho {
             }
         }
     }
+
+    /// Find a section in the currently loaded dylib (the image containing this code).
+    ///
+    /// Unlike `find_section` which searches the main executable (image index 0),
+    /// this function uses `dladdr` to find which Mach-O image the calling code
+    /// belongs to, then searches for the section in that image using
+    /// `getsectiondata`.
+    pub fn find_section_in_current_image(
+        _section_name: &str,
+    ) -> std::io::Result<Option<&'static [u8]>> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            // TODO: Intel Mac dylib support
+            Ok(None)
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            use super::SEGNAME;
+            use std::ffi::CString;
+            use std::os::raw::c_char;
+
+            // Use the Mach-O header-aware getsectiondata instead of getsectdata.
+            // getsectiondata takes a mach_header_64 pointer and returns the section
+            // data for that specific image.
+            #[repr(C)]
+            #[allow(non_camel_case_types)]
+            struct mach_header_64 {
+                _data: [u8; 32],
+            }
+
+            #[repr(C)]
+            #[allow(non_camel_case_types)]
+            struct Dl_info {
+                dli_fname: *const c_char,
+                dli_fbase: *mut std::ffi::c_void,
+                dli_sname: *const c_char,
+                dli_saddr: *mut std::ffi::c_void,
+            }
+
+            extern "C" {
+                fn getsectiondata(
+                    mhp: *const mach_header_64,
+                    segname: *const c_char,
+                    sectname: *const c_char,
+                    size: *mut usize,
+                ) -> *mut u8;
+
+                fn dladdr(addr: *const std::ffi::c_void, info: *mut Dl_info) -> std::ffi::c_int;
+            }
+
+            // Use dladdr on a function in this library to find our image's base address.
+            // The base address (dli_fbase) is the mach_header_64 pointer for our image.
+            let mut info: Dl_info = unsafe { std::mem::zeroed() };
+            let self_addr = find_section_in_current_image as *const std::ffi::c_void;
+            let ret = unsafe { dladdr(self_addr, &mut info) };
+            if ret == 0 || info.dli_fbase.is_null() {
+                return Ok(None);
+            }
+
+            let mh = info.dli_fbase as *const mach_header_64;
+            let section_name = CString::new(_section_name)
+                .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+
+            let mut section_size: usize = 0;
+            let ptr = unsafe {
+                getsectiondata(
+                    mh,
+                    SEGNAME.as_ptr() as *const c_char,
+                    section_name.as_ptr() as *const c_char,
+                    &mut section_size,
+                )
+            };
+
+            if ptr.is_null() || section_size == 0 {
+                return Ok(None);
+            }
+
+            // SAFETY: The dylib is loaded for the lifetime of the process (or until
+            // dlclose), and we expect the caller to keep the dylib loaded. The
+            // section data is mapped by the kernel, so it's safe to return 'static.
+            let data: &'static [u8] = unsafe { std::slice::from_raw_parts(ptr, section_size) };
+            Ok(Some(data))
+        }
+    }
 }
 
 pub struct Elf<'a> {
@@ -1130,9 +1219,16 @@ mod elf {
             );
         }
 
-        let mut p = main_program_info.dlpi_phdr as *const u8;
-        let mut n = main_program_info.dlpi_phnum as usize;
-        let base = main_program_info.dlpi_addr as usize;
+        find_section_in_phdr_info(&main_program_info, name)
+    }
+
+    fn find_section_in_phdr_info(
+        info: &dl_phdr_info,
+        name: &str,
+    ) -> std::io::Result<Option<&'static [u8]>> {
+        let mut p = info.dlpi_phdr as *const u8;
+        let mut n = info.dlpi_phnum as usize;
+        let base = info.dlpi_addr as usize;
 
         while n > 0 {
             let phdr = unsafe { &*(p as *const Elf64_Phdr) };
@@ -1143,8 +1239,8 @@ mod elf {
                     let segment = unsafe { std::slice::from_raw_parts(pos as *const u8, len) };
                     let align = (phdr.p_align as usize).max(4);
                     if let Some(section_data) = find_in_note_segment(segment, align, name) {
-                        // SAFETY: `segment` points into a mapped PT_LOAD range of the main
-                        // executable. That mapping stays valid for the process lifetime,
+                        // SAFETY: `segment` points into a mapped PT_LOAD range.
+                        // That mapping stays valid for the process lifetime (or until dlclose),
                         // so it is safe to extend the slice's lifetime to 'static here.
                         let data: &'static [u8] = unsafe { std::mem::transmute(section_data) };
                         return Ok(Some(data));
@@ -1157,6 +1253,75 @@ mod elf {
         }
 
         Ok(None)
+    }
+
+    /// Find a section in the currently loaded shared library (the image
+    /// containing this code).
+    ///
+    /// Unlike `find_section` which searches the main executable,
+    /// this function uses `dladdr` to determine which shared object the
+    /// calling code belongs to, then iterates `dl_iterate_phdr` to find
+    /// the matching image and searches its PT_NOTE segments.
+    pub fn find_section_in_current_image(name: &str) -> std::io::Result<Option<&'static [u8]>> {
+        use libc::dladdr;
+
+        #[repr(C)]
+        #[allow(non_camel_case_types)]
+        struct Dl_info {
+            dli_fname: *const std::os::raw::c_char,
+            dli_fbase: *mut c_void,
+            dli_sname: *const std::os::raw::c_char,
+            dli_saddr: *mut c_void,
+        }
+
+        // Find which shared object we are in by looking up our own function address
+        let mut info: Dl_info = unsafe { std::mem::zeroed() };
+        let self_addr = find_section_in_current_image as *const c_void;
+        let ret = unsafe { dladdr(self_addr, &mut info as *mut Dl_info as *mut _) };
+        if ret == 0 || info.dli_fbase.is_null() {
+            return Ok(None);
+        }
+        let our_base = info.dli_fbase as usize;
+
+        // Now iterate all loaded images to find the one matching our base address
+        struct CallbackData {
+            target_base: usize,
+            result: dl_phdr_info,
+            found: bool,
+        }
+
+        unsafe extern "C" fn callback(
+            info: *mut dl_phdr_info,
+            _size: usize,
+            data: *mut c_void,
+        ) -> c_int {
+            let cb = &mut *(data as *mut CallbackData);
+            if (*info).dlpi_addr as usize == cb.target_base {
+                cb.result = *info;
+                cb.found = true;
+                return 1; // stop iteration
+            }
+            0 // continue
+        }
+
+        let mut cb_data = CallbackData {
+            target_base: our_base,
+            result: unsafe { std::mem::zeroed() },
+            found: false,
+        };
+
+        unsafe {
+            dl_iterate_phdr(
+                Some(callback),
+                &mut cb_data as *mut CallbackData as *mut c_void,
+            );
+        }
+
+        if !cb_data.found {
+            return Ok(None);
+        }
+
+        find_section_in_phdr_info(&cb_data.result, name)
     }
 }
 
