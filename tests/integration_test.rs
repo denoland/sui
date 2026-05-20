@@ -429,6 +429,38 @@ fn utils() {
     assert!(!utils::is_pe(&macho));
 }
 
+#[test]
+fn test_macho_section_name_length_limit() {
+    let _lock = PROCESS_LOCK.lock().unwrap();
+
+    let input = std::fs::read("tests/exec_mach64").unwrap();
+
+    // 16 bytes is the documented limit and should succeed.
+    let exactly_16 = "0123456789abcdef";
+    assert_eq!(exactly_16.len(), 16);
+    assert!(Macho::from(input.clone())
+        .unwrap()
+        .write_section(exactly_16, vec![0; 32])
+        .is_ok());
+
+    // 17 bytes must return an error, not panic.
+    let too_long = "0123456789abcdefg";
+    assert_eq!(too_long.len(), 17);
+    match Macho::from(input)
+        .unwrap()
+        .write_section(too_long, vec![0; 32])
+    {
+        Ok(_) => panic!("section name longer than 16 bytes must error"),
+        Err(err) => {
+            let msg = format!("{}", err);
+            assert!(
+                msg.contains("16 bytes"),
+                "error should mention the 16-byte limit, got: {msg}",
+            );
+        }
+    }
+}
+
 /// This test ensures that processing Intel Mac binaries works even when
 /// codesign is not available (e.g., when cross-compiling from Linux).
 #[test]

@@ -43,6 +43,14 @@
 //! #     Ok(())
 //! # }
 //! ```
+//!
+//! # Section name limits
+//!
+//! Mach-O stores section names in a fixed 16-byte field, so names passed to
+//! [`Macho::write_section`] must be at most 16 bytes long; longer names
+//! return [`Error::InvalidObject`]. PE resource names ([`PortableExecutable::write_resource`])
+//! and ELF note section names ([`Elf::append`]) have no comparable 16-byte
+//! limit.
 
 use core::mem::size_of;
 use editpe::{
@@ -530,7 +538,19 @@ impl Macho {
         })
     }
 
+    /// Write a section into the Mach-O file.
+    ///
+    /// `name` is the Mach-O section name. The Mach-O format stores section
+    /// names in a fixed-size 16-byte field, so `name` must be at most
+    /// **16 bytes** long. Names longer than 16 bytes return
+    /// [`Error::InvalidObject`] instead of panicking.
     pub fn write_section(mut self, name: &str, sectdata: Vec<u8>) -> Result<Self, Error> {
+        if name.len() > 16 {
+            return Err(Error::InvalidObject(
+                "Mach-O section name must be at most 16 bytes",
+            ));
+        }
+
         /* x86_64 */
         if self.header.cputype != CPU_TYPE_ARM_64 {
             self.sectdata = Some(sectdata);
