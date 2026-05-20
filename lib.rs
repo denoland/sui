@@ -51,6 +51,22 @@
 //! return [`Error::InvalidObject`]. PE resource names ([`PortableExecutable::write_resource`])
 //! and ELF note section names ([`Elf::append`]) have no comparable 16-byte
 //! limit.
+//!
+//! # Packers (UPX, etc.)
+//!
+//! Runtime packers compress the original program and decompress it back into
+//! memory at startup, replacing the on-disk section layout with the packer's
+//! own envelope. Embedded sections, notes, and (in many cases) resources are
+//! hidden inside the packed payload, so [`find_section`] will not see data
+//! that was injected *before* packing.
+//!
+//! There is no fully packer-proof embedding scheme that works the way
+//! NativeAOT does on .NET (NativeAOT owns both the producer and the runtime
+//! extractor, so it can decompress its own payload after the stub restores
+//! memory). The recommended workaround with libsui is to **pack first, then
+//! inject** — libsui's writers operate on the final on-disk layout, so a
+//! resource/note/segment added after packing is not touched by the
+//! unpacker stub at startup. See the project README for per-format details.
 
 use core::mem::size_of;
 use editpe::{
@@ -403,6 +419,8 @@ const LC_DYLIB_CODE_SIGN_DRS: u32 = 0x2b;
 const LC_LINKER_OPTIMIZATION_HINT: u32 = 0x2d;
 const LC_DYLD_EXPORTS_TRIE: u32 = 0x80000033;
 const LC_DYLD_CHAINED_FIXUPS: u32 = 0x80000034;
+const LC_FUNCTION_VARIANTS: u32 = 0x37;
+const LC_FUNCTION_VARIANT_FIXUPS: u32 = 0x38;
 
 const CPU_TYPE_ARM_64: i32 = 0x0100000c;
 
@@ -664,7 +682,9 @@ impl Macho {
                 | LC_ATOM_INFO
                 | LC_LINKER_OPTIMIZATION_HINT
                 | LC_DYLD_EXPORTS_TRIE
-                | LC_DYLD_CHAINED_FIXUPS => {
+                | LC_DYLD_CHAINED_FIXUPS
+                | LC_FUNCTION_VARIANTS
+                | LC_FUNCTION_VARIANT_FIXUPS => {
                     #[derive(FromBytes, FromZeroes, AsBytes)]
                     #[repr(C)]
                     struct LinkeditDataCommand {
@@ -1372,5 +1392,121 @@ pub mod utils {
         }
         let magic = u16::from_le_bytes([data[0], data[1]]);
         magic == 0x5a4d
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Build a minimal arm64 Mach-O containing __TEXT, __LINKEDIT, and the
+    // dyld-1284.13 commands LC_FUNCTION_VARIANTS / LC_FUNCTION_VARIANT_FIXUPS,
+    // then verify write_section shifts their dataoff into the new LINKEDIT
+    // location.
+    #[test]
+    fn shifts_function_variants_offsets() {
+        const HEADER_SIZE: usize = size_of::<Header64>();
+        const SEG_SIZE: usize = size_of::<SegmentCommand64>();
+        const LINKEDIT_CMD_SIZE: usize = 16;
+
+        let sizeofcmds = SEG_SIZE * 2 + LINKEDIT_CMD_SIZE * 2;
+        let padding = 256usize;
+        let linkedit_fileoff = HEADER_SIZE + sizeofcmds + padding;
+        let linkedit_filesize: u64 = 32;
+
+        let header = Header64 {
+            magic: 0xfeedfacf,
+            cputype: CPU_TYPE_ARM_64,
+            cpusubtype: 0,
+            filetype: 2,
+            ncmds: 4,
+            sizeofcmds: sizeofcmds as u32,
+            flags: 0,
+            reserved: 0,
+        };
+
+        let text_seg = SegmentCommand64 {
+            cmd: LC_SEGMENT_64,
+            cmdsize: SEG_SIZE as u32,
+            segname: *b"__TEXT\0\0\0\0\0\0\0\0\0\0",
+            vmaddr: 0,
+            vmsize: 0x4000,
+            fileoff: 0,
+            filesize: linkedit_fileoff as u64,
+            maxprot: 5,
+            initprot: 5,
+            nsects: 0,
+            flags: 0,
+        };
+
+        let linkedit_seg = SegmentCommand64 {
+            cmd: LC_SEGMENT_64,
+            cmdsize: SEG_SIZE as u32,
+            segname: *b"__LINKEDIT\0\0\0\0\0\0",
+            vmaddr: 0x4000,
+            vmsize: 0x4000,
+            fileoff: linkedit_fileoff as u64,
+            filesize: linkedit_filesize,
+            maxprot: 1,
+            initprot: 1,
+            nsects: 0,
+            flags: 0,
+        };
+
+        let fv_dataoff = linkedit_fileoff as u32;
+        let fvf_dataoff = linkedit_fileoff as u32 + 8;
+
+        let mut obj = Vec::new();
+        obj.extend_from_slice(header.as_bytes());
+        obj.extend_from_slice(text_seg.as_bytes());
+        obj.extend_from_slice(linkedit_seg.as_bytes());
+        // LC_FUNCTION_VARIANTS as linkedit_data_command
+        obj.extend_from_slice(&LC_FUNCTION_VARIANTS.to_le_bytes());
+        obj.extend_from_slice(&(LINKEDIT_CMD_SIZE as u32).to_le_bytes());
+        obj.extend_from_slice(&fv_dataoff.to_le_bytes());
+        obj.extend_from_slice(&8u32.to_le_bytes());
+        // LC_FUNCTION_VARIANT_FIXUPS as linkedit_data_command
+        obj.extend_from_slice(&LC_FUNCTION_VARIANT_FIXUPS.to_le_bytes());
+        obj.extend_from_slice(&(LINKEDIT_CMD_SIZE as u32).to_le_bytes());
+        obj.extend_from_slice(&fvf_dataoff.to_le_bytes());
+        obj.extend_from_slice(&8u32.to_le_bytes());
+        // padding between commands and __LINKEDIT
+        obj.resize(linkedit_fileoff, 0);
+        // __LINKEDIT bytes
+        obj.extend_from_slice(&vec![0xAB; linkedit_filesize as usize]);
+
+        let sectdata = vec![0u8; 16];
+        let macho = Macho::from(obj).unwrap();
+        let macho = macho.write_section("__test", sectdata).unwrap();
+
+        let expected_shift = align_vmsize(16, 0x10000);
+
+        // Walk commands in the in-memory buffer to find the patched dataoffs.
+        let mut found_fv = None;
+        let mut found_fvf = None;
+        for (cmd, _cmdsize, offset) in &macho.commands {
+            if *cmd == LC_FUNCTION_VARIANTS {
+                let dataoff = u32::from_le_bytes(
+                    macho.data[offset + 8..offset + 12].try_into().unwrap(),
+                );
+                found_fv = Some(dataoff);
+            } else if *cmd == LC_FUNCTION_VARIANT_FIXUPS {
+                let dataoff = u32::from_le_bytes(
+                    macho.data[offset + 8..offset + 12].try_into().unwrap(),
+                );
+                found_fvf = Some(dataoff);
+            }
+        }
+
+        assert_eq!(
+            found_fv,
+            Some(fv_dataoff + expected_shift as u32),
+            "LC_FUNCTION_VARIANTS dataoff was not shifted"
+        );
+        assert_eq!(
+            found_fvf,
+            Some(fvf_dataoff + expected_shift as u32),
+            "LC_FUNCTION_VARIANT_FIXUPS dataoff was not shifted"
+        );
     }
 }
