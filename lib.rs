@@ -43,6 +43,22 @@
 //! #     Ok(())
 //! # }
 //! ```
+//!
+//! # Packers (UPX, etc.)
+//!
+//! Runtime packers compress the original program and decompress it back into
+//! memory at startup, replacing the on-disk section layout with the packer's
+//! own envelope. Embedded sections, notes, and (in many cases) resources are
+//! hidden inside the packed payload, so [`find_section`] will not see data
+//! that was injected *before* packing.
+//!
+//! There is no fully packer-proof embedding scheme that works the way
+//! NativeAOT does on .NET (NativeAOT owns both the producer and the runtime
+//! extractor, so it can decompress its own payload after the stub restores
+//! memory). The recommended workaround with libsui is to **pack first, then
+//! inject** — libsui's writers operate on the final on-disk layout, so a
+//! resource/note/segment added after packing is not touched by the
+//! unpacker stub at startup. See the project README for per-format details.
 
 use core::mem::size_of;
 use editpe::{

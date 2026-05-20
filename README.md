@@ -118,6 +118,40 @@ new SUI note to the note segment data.
 At run-time, data is extracted from note segments in memory using
 `dl_iterate_phdr`.
 
+## Packers (UPX, etc.)
+
+Runtime executable packers like [UPX](https://upx.github.io/) compress the
+original program and prepend a small stub that decompresses it back into
+memory at startup. The packed file on disk no longer contains the original
+section layout — sections, segments, notes, and (in many cases) resources
+are replaced by the packer's own envelope, so libsui's runtime lookup will
+fail on a packed binary that was injected *before* packing.
+
+There is no fully packer-proof embedding scheme that works the way
+NativeAOT does on .NET: NativeAOT owns both the producer and the runtime
+extractor, so it can decompress its own payload after the stub has
+restored memory. libsui is a generic injection tool and has no hook into
+the unpacker, so it cannot recover data that the packer has hidden inside
+its compressed envelope.
+
+The recommended workaround is **pack first, then inject**. libsui's
+writers operate on the final on-disk layout, so injecting after packing
+adds a fresh section/resource/note that the unpacker's stub never
+touches:
+
+| Format        | Behavior of `libsui` injection on top of a packed binary               |
+|---------------|------------------------------------------------------------------------|
+| PE (UPX)      | A new `RT_RCDATA` resource is added to `.rsrc`; UPX preserves the resource directory, so `find_section` continues to work. |
+| ELF (UPX)     | A new `.note.sui` is placed in a fresh `PT_LOAD` past the packed payload, with a matching `PT_NOTE` program header. `dl_iterate_phdr` enumerates the program headers after the unpacker hands control back, so the note remains visible. |
+| Mach-O arm64  | A new `__SUI` segment is appended after `__LINKEDIT`; `getsectdata` reads it directly from the mapped image. (Most packers on Apple Silicon are blocked by code signing anyway.) |
+| Mach-O x86_64 | Data is appended past the end of the file with a sentinel marker; this survives any packer that does not truncate or rewrite the file tail. |
+
+Injecting *before* packing is not supported: the packer is free to
+discard or relocate the embedded data, and on ELF/Mach-O the runtime
+lookup will not find it. If you must pack a binary that already contains
+libsui data, treat it as a build step ordering issue and move the
+injection to after the pack step.
+
 ## Testing
 
 This crate is fuzzed with LLVM's libFuzzer. See [fuzz/](fuzz/).
