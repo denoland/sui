@@ -403,7 +403,7 @@ mod pe {
             .map_err(std::io::Error::other)?;
 
             let resource_handle = match FindResourceA(
-                Some(hmodule),
+                hmodule,
                 PCSTR::from_raw(section_name.as_ptr() as *const u8),
                 RT_RCDATA,
             ) {
@@ -411,10 +411,10 @@ mod pe {
                 Err(_) => return Ok(None),
             };
 
-            let resource_data = LoadResource(Some(hmodule), resource_handle)
+            let resource_data = LoadResource(hmodule, resource_handle)
                 .map_err(std::io::Error::other)?;
 
-            let resource_size = SizeofResource(Some(hmodule), resource_handle);
+            let resource_size = SizeofResource(hmodule, resource_handle);
             if resource_size == 0 {
                 return Ok(Some(&[]));
             }
