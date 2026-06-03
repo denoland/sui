@@ -94,6 +94,8 @@ pub use macho::find_section;
 pub use macho::find_section_in_current_image;
 #[cfg(windows)]
 pub use pe::find_section;
+#[cfg(windows)]
+pub use pe::find_section_in_current_image;
 
 #[derive(Debug)]
 pub enum Error {
@@ -362,6 +364,60 @@ mod pe {
                     "LockResource returned a null pointer",
                 ));
             }
+            Ok(Some(std::slice::from_raw_parts(
+                resource_ptr as *const u8,
+                resource_size as usize,
+            )))
+        }
+    }
+
+    /// Like [`find_section`], but reads the resource from the module (DLL or
+    /// EXE) that contains *this* code rather than the process's main
+    /// executable. Used by the desktop runtime where the payload is embedded
+    /// in the runtime library (denort.dll) loaded by the WEF host.
+    pub fn find_section_in_current_image(
+        section_name: &str,
+    ) -> std::io::Result<Option<&'static [u8]>> {
+        use windows_sys::Win32::System::LibraryLoader::{
+            GetModuleHandleExA, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        };
+        let section_name = section_name.to_uppercase();
+        let section_name = CString::new(section_name)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+
+        unsafe {
+            // Resolve the module containing this function's code so the lookup
+            // targets the current image, not the process executable.
+            let mut hmod: isize = 0;
+            let self_addr = find_section_in_current_image as *const u8;
+            if GetModuleHandleExA(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                    | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                self_addr,
+                &mut hmod,
+            ) == 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+
+            let resource_handle =
+                FindResourceA(hmod, section_name.as_ptr() as _, 10 as *const _);
+            if resource_handle == 0 {
+                return Ok(None);
+            }
+
+            let resource_data = LoadResource(hmod, resource_handle);
+            if resource_data == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+
+            let resource_size = SizeofResource(hmod, resource_handle);
+            if resource_size == 0 {
+                return Ok(Some(&[]));
+            }
+
+            let resource_ptr = LockResource(resource_data);
             Ok(Some(std::slice::from_raw_parts(
                 resource_ptr as *const u8,
                 resource_size as usize,
