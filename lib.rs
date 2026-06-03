@@ -94,6 +94,8 @@ pub use macho::find_section;
 pub use macho::find_section_in_current_image;
 #[cfg(windows)]
 pub use pe::find_section;
+#[cfg(windows)]
+pub use pe::find_section_in_current_image;
 
 #[derive(Debug)]
 pub enum Error {
@@ -352,6 +354,67 @@ mod pe {
                 LoadResource(None, resource_handle).map_err(std::io::Error::other)?;
 
             let resource_size = SizeofResource(None, resource_handle);
+            if resource_size == 0 {
+                return Ok(Some(&[]));
+            }
+
+            let resource_ptr = LockResource(resource_data);
+            if resource_ptr.is_null() {
+                return Err(std::io::Error::other(
+                    "LockResource returned a null pointer",
+                ));
+            }
+            Ok(Some(std::slice::from_raw_parts(
+                resource_ptr as *const u8,
+                resource_size as usize,
+            )))
+        }
+    }
+
+    /// Like [`find_section`], but reads the resource from the module (DLL or
+    /// EXE) that contains *this* code rather than the process's main
+    /// executable. Used by the desktop runtime where the payload is embedded
+    /// in the runtime library (denort.dll) loaded by the WEF host.
+    pub fn find_section_in_current_image(
+        section_name: &str,
+    ) -> std::io::Result<Option<&'static [u8]>> {
+        use windows::Win32::Foundation::HMODULE;
+        use windows::Win32::System::LibraryLoader::{
+            GetModuleHandleExA, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        };
+
+        let section_name = section_name.to_uppercase();
+        let section_name = CString::new(section_name)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+
+        // SAFETY: mirrors `find_section`, but resolves the module that contains
+        // this function's code (FROM_ADDRESS) so the lookup targets the current
+        // image (e.g. denort.dll) instead of the process executable. The typed
+        // `windows` wrappers return `Result`s and strongly-typed handles.
+        unsafe {
+            let mut hmodule = HMODULE::default();
+            GetModuleHandleExA(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                    | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                PCSTR(find_section_in_current_image as *const u8),
+                &mut hmodule,
+            )
+            .map_err(std::io::Error::other)?;
+
+            let resource_handle = match FindResourceA(
+                hmodule,
+                PCSTR::from_raw(section_name.as_ptr() as *const u8),
+                RT_RCDATA,
+            ) {
+                Ok(h) => h,
+                Err(_) => return Ok(None),
+            };
+
+            let resource_data = LoadResource(hmodule, resource_handle)
+                .map_err(std::io::Error::other)?;
+
+            let resource_size = SizeofResource(hmodule, resource_handle);
             if resource_size == 0 {
                 return Ok(Some(&[]));
             }
