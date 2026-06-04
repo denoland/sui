@@ -23,6 +23,29 @@
  * THE SOFTWARE.
  */
 
+// Intel macOS doesn't support named Mach-O sections appended after link via
+// `getsectdata`, so we use a sentinel-based trailer format at the end of the
+// file. Each appended section is encoded as a self-contained trailer; multiple
+// trailers chain back-to-back at the end of the binary.
+//
+// Trailer layout (per section):
+//
+//   sentinel:  16 bytes  "<~sui-data~>" (12) + magic (4)
+//   name_len:   1 byte   u8
+//   name:    name_len bytes (UTF-8, not NUL-terminated)
+//   data_len:   8 bytes  u64 little-endian
+//   data:    data_len bytes
+//
+// Two magic values are recognized:
+//   * `LEGACY_MAGIC` (0xEFBEADDE) — older format without a name field. Reader
+//     treats the "name" implicitly as the empty string; this is what early
+//     deno-compile binaries used.
+//   * `MAGIC` (0xDEADC0DE) — current format with a name field.
+//
+// `find_section(name)` walks backwards from EOF: it scans for a sentinel, and
+// if the trailer's name doesn't match, continues searching strictly before that
+// sentinel's start. This is how multiple appended sections coexist.
+
 fn parse_c_str(buf: &[u8]) -> Option<String> {
     for (i, &byte) in buf.iter().enumerate() {
         if byte == 0 {
@@ -77,95 +100,147 @@ fn patch_command(cmd_type: u32, buf: &mut [u8], file_len: usize) {
     }
 }
 
-/// Find section data in an Intel Mac Mach-O executable
-///
-/// Searches for the sentinel "<~sui-data~>" from the end of the executable,
-/// reads the data length, and returns a reference to the section data.
-///
-/// # Returns
-///
-/// Returns `Some(&[u8])` if section data is found, `None` otherwise
-pub fn find_section() -> std::io::Result<Option<&'static [u8]>> {
-    use std::io::{Read, Seek, SeekFrom};
+const SENTINEL_PREFIX_LEN: usize = 12;
+const MAGIC_LEN: usize = 4;
+const SENTINEL_LEN: usize = SENTINEL_PREFIX_LEN + MAGIC_LEN;
 
-    // Construct sentinel from reversed string to prevent it from existing as contiguous
-    // bytes in the binary. Use black_box to prevent compiler from const-evaluating.
-    let mut sentinel = Vec::with_capacity(16);
-    let reversed = std::hint::black_box(b">~atad-ius~<"); // "<~sui-data~>" reversed
-    for &byte in reversed.iter().rev() {
-        sentinel.push(byte);
+/// New trailer format: sentinel includes a section-name prefix.
+const MAGIC: [u8; 4] = [0xDE, 0xC0, 0xAD, 0xDE]; // 0xDEADC0DE, little-endian
+/// Legacy trailer format (no name); old deno-compile binaries.
+const LEGACY_MAGIC: [u8; 4] = [0xEF, 0xBE, 0xAD, 0xDE]; // 0xDEADBEEF, little-endian
+
+fn sentinel_prefix() -> [u8; SENTINEL_PREFIX_LEN] {
+    // Reverse the literal so the sentinel bytes don't appear contiguously in
+    // the binary itself, only in appended trailers.
+    let reversed = std::hint::black_box(b">~atad-ius~<");
+    let mut out = [0u8; SENTINEL_PREFIX_LEN];
+    for i in 0..SENTINEL_PREFIX_LEN {
+        out[i] = reversed[SENTINEL_PREFIX_LEN - 1 - i];
     }
-    // Add magic bytes in reverse order with black_box
-    let magic = std::hint::black_box([0xEF, 0xBE, 0xAD, 0xDE]);
-    sentinel.extend_from_slice(&magic);
-    let sentinel = sentinel.as_slice();
+    out
+}
+
+fn build_sentinel(magic: [u8; 4]) -> [u8; SENTINEL_LEN] {
+    let prefix = sentinel_prefix();
+    let magic = std::hint::black_box(magic);
+    let mut out = [0u8; SENTINEL_LEN];
+    out[..SENTINEL_PREFIX_LEN].copy_from_slice(&prefix);
+    out[SENTINEL_PREFIX_LEN..].copy_from_slice(&magic);
+    out
+}
+
+/// Append a section trailer to `buf` in the current (named) format.
+pub fn append_trailer(buf: &mut Vec<u8>, name: &str, data: &[u8]) {
+    let sentinel = build_sentinel(MAGIC);
+    buf.extend_from_slice(&sentinel);
+    let name_bytes = name.as_bytes();
+    assert!(
+        name_bytes.len() <= u8::MAX as usize,
+        "libsui section name too long ({} > 255 bytes)",
+        name_bytes.len()
+    );
+    buf.push(name_bytes.len() as u8);
+    buf.extend_from_slice(name_bytes);
+    buf.extend_from_slice(&(data.len() as u64).to_le_bytes());
+    buf.extend_from_slice(data);
+}
+
+/// Match the trailer at `file[s..]` against `name`.
+///
+/// Returns `Some(Ok(data_range))` if the trailer matches the requested name,
+/// `Some(Err(()))` if the trailer is well-formed but the name doesn't match
+/// (caller should continue scanning earlier in the file), or `None` if the
+/// candidate sentinel position isn't a valid trailer header (probably a stray
+/// match — treat as not-a-trailer).
+fn match_trailer_at(
+    file: &[u8],
+    s: usize,
+    name: &str,
+) -> Option<Result<std::ops::Range<usize>, ()>> {
+    let magic_off = s + SENTINEL_PREFIX_LEN;
+    if magic_off + MAGIC_LEN > file.len() {
+        return None;
+    }
+    let magic: [u8; 4] = file[magic_off..magic_off + MAGIC_LEN].try_into().ok()?;
+    let (name_match, data_off, data_len) = if magic == MAGIC {
+        let name_len_off = s + SENTINEL_LEN;
+        if name_len_off + 1 > file.len() {
+            return None;
+        }
+        let name_len = file[name_len_off] as usize;
+        let name_off = name_len_off + 1;
+        let data_len_off = name_off + name_len;
+        if data_len_off + 8 > file.len() {
+            return None;
+        }
+        let candidate = &file[name_off..name_off + name_len];
+        let data_len = read_u64_le(file, data_len_off) as usize;
+        let data_off = data_len_off + 8;
+        (candidate == name.as_bytes(), data_off, data_len)
+    } else if magic == LEGACY_MAGIC {
+        // Legacy trailer: no name, treat as matching only an empty query.
+        let data_len_off = s + SENTINEL_LEN;
+        if data_len_off + 8 > file.len() {
+            return None;
+        }
+        let data_len = read_u64_le(file, data_len_off) as usize;
+        let data_off = data_len_off + 8;
+        (name.is_empty(), data_off, data_len)
+    } else {
+        return None;
+    };
+    if data_off + data_len > file.len() {
+        return None;
+    }
+    if name_match {
+        Some(Ok(data_off..data_off + data_len))
+    } else {
+        Some(Err(()))
+    }
+}
+
+/// Find section data in an Intel Mac Mach-O executable.
+///
+/// Searches backward from EOF for trailers matching `name`. Multiple trailers
+/// may be chained; non-matching trailers are skipped over.
+pub fn find_section(name: &str) -> std::io::Result<Option<&'static [u8]>> {
+    use std::io::Read;
 
     let exe = std::env::current_exe()?;
     let mut file = std::fs::File::open(exe)?;
+    // For simplicity, read the whole file. Existing deno binaries are
+    // ~100MB at most; this is a one-shot at startup.
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?;
 
-    // Get file size
-    let file_size = file.seek(SeekFrom::End(0))?;
-
-    // Search backwards for sentinel in chunks to avoid allocating huge buffer
-    const CHUNK_SIZE: usize = 1024 * 1024; // 1MB chunks
-    let overlap = sentinel.len() + 8; // Overlap to handle sentinel across chunk boundaries
-
-    let mut pos = file_size;
-    let mut prev_chunk_tail = vec![0u8; 0];
-
-    while pos > 0 {
-        let chunk_start = pos.saturating_sub(CHUNK_SIZE as u64);
-        let chunk_len = (pos - chunk_start) as usize;
-
-        file.seek(SeekFrom::Start(chunk_start))?;
-        let mut chunk = vec![0u8; chunk_len];
-        file.read_exact(&mut chunk)?;
-
-        // Append previous chunk tail for overlap handling
-        chunk.extend_from_slice(&prev_chunk_tail);
-
-        // Find sentinel from the end of this chunk
-        for i in (0..=(chunk.len().saturating_sub(sentinel.len()))).rev() {
-            if &chunk[i..i + sentinel.len()] == sentinel {
-                // Found sentinel, read data length (u64 after sentinel)
-                if i + sentinel.len() + 8 > chunk.len() {
-                    return Ok(None);
-                }
-
-                let len_bytes: [u8; 8] = chunk[i + sentinel.len()..i + sentinel.len() + 8]
-                    .try_into()
-                    .map_err(|_| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid length")
-                    })?;
-                let data_len = u64::from_le_bytes(len_bytes) as usize;
-
-                // Read the actual data
-                let data_start = i + sentinel.len() + 8;
-                if data_start + data_len > chunk.len() {
-                    // We need to read the rest of the data from the file
-                    let mut data = chunk[data_start..].to_vec(); // data we already have
-                    let remaining = data_len - (chunk.len() - data_start); // how much we need to read
-                    file.seek(SeekFrom::Start(chunk_start + chunk.len() as u64))?;
-                    if chunk.len() < remaining {
-                        chunk.extend(std::iter::repeat_n(0, remaining - chunk.len()));
-                    }
-                    file.read_exact(&mut chunk[..remaining])?;
-                    data.extend_from_slice(&chunk[..remaining]);
-                    return Ok(Some(Box::leak(data.into_boxed_slice())));
-                }
-                let data = chunk[data_start..data_start + data_len].to_vec();
+    let prefix = sentinel_prefix();
+    // Walk backward looking for sentinel prefixes. Each candidate is validated
+    // by `match_trailer_at`.
+    let mut end = buf.len();
+    while end >= SENTINEL_LEN {
+        let search_end = end.saturating_sub(SENTINEL_PREFIX_LEN - 1).max(1);
+        let Some(rel) =
+            buf[..search_end].windows(SENTINEL_PREFIX_LEN).rposition(|w| w == prefix)
+        else {
+            return Ok(None);
+        };
+        let s = rel;
+        match match_trailer_at(&buf, s, name) {
+            Some(Ok(range)) => {
+                let data = buf[range].to_vec();
                 return Ok(Some(Box::leak(data.into_boxed_slice())));
             }
+            Some(Err(())) => {
+                // Trailer was valid but name didn't match: continue searching
+                // strictly before this sentinel.
+                end = s;
+            }
+            None => {
+                // Stray sentinel bytes (e.g., inside arbitrary data). Skip
+                // past this candidate and keep walking backward.
+                end = s;
+            }
         }
-
-        // Save tail of current chunk for next iteration (for overlap)
-        prev_chunk_tail = if chunk_len > overlap {
-            chunk[..overlap].to_vec()
-        } else {
-            chunk
-        };
-
-        pos = chunk_start;
     }
 
     Ok(None)
@@ -268,5 +343,55 @@ mod tests {
     fn test_patch_macho_executable_invalid() {
         let mut buf = vec![0u8; 10];
         assert_eq!(patch_macho_executable(&mut buf), false);
+    }
+
+    fn find_in(buf: &[u8], name: &str) -> Option<Vec<u8>> {
+        let prefix = sentinel_prefix();
+        let mut end = buf.len();
+        while end >= SENTINEL_LEN {
+            let search_end = end.saturating_sub(SENTINEL_PREFIX_LEN - 1).max(1);
+            let Some(s) =
+                buf[..search_end].windows(SENTINEL_PREFIX_LEN).rposition(|w| w == prefix)
+            else {
+                return None;
+            };
+            match match_trailer_at(buf, s, name) {
+                Some(Ok(range)) => return Some(buf[range].to_vec()),
+                Some(Err(())) | None => end = s,
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn append_and_find_single() {
+        let mut buf = b"some-binary-body".to_vec();
+        append_trailer(&mut buf, "dnclbk", b"hello world");
+        assert_eq!(find_in(&buf, "dnclbk").as_deref(), Some(&b"hello world"[..]));
+        assert_eq!(find_in(&buf, "other"), None);
+    }
+
+    #[test]
+    fn append_and_find_chained() {
+        let mut buf = b"binary".to_vec();
+        append_trailer(&mut buf, "dnclbk", &vec![0xAAu8; 4096]);
+        append_trailer(&mut buf, "d3n0l4nd", &vec![0xBBu8; 1638]);
+        assert_eq!(find_in(&buf, "d3n0l4nd").map(|v| v.len()), Some(1638));
+        assert_eq!(find_in(&buf, "dnclbk").map(|v| v.len()), Some(4096));
+        assert!(find_in(&buf, "d3n0l4nd").unwrap().iter().all(|&b| b == 0xBB));
+        assert!(find_in(&buf, "dnclbk").unwrap().iter().all(|&b| b == 0xAA));
+    }
+
+    #[test]
+    fn legacy_trailer_matches_empty_name() {
+        // Construct a legacy trailer manually: sentinel(LEGACY_MAGIC) + data_len + data.
+        let mut buf = b"old-binary".to_vec();
+        let sentinel = build_sentinel(LEGACY_MAGIC);
+        buf.extend_from_slice(&sentinel);
+        let data = b"legacy-data";
+        buf.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        buf.extend_from_slice(data);
+        assert_eq!(find_in(&buf, "").as_deref(), Some(&data[..]));
+        assert_eq!(find_in(&buf, "dnclbk"), None);
     }
 }

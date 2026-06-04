@@ -527,7 +527,7 @@ pub struct Macho {
     data: Vec<u8>,
     seg: SegmentCommand64,
     sec: Section64,
-    sectdata: Option<Vec<u8>>,
+    sectdata: Option<(String, Vec<u8>)>,
 }
 
 pub(crate) const SEGNAME: [u8; 16] = *b"__SUI\0\0\0\0\0\0\0\0\0\0\0";
@@ -646,7 +646,7 @@ impl Macho {
 
         /* x86_64 */
         if self.header.cputype != CPU_TYPE_ARM_64 {
-            self.sectdata = Some(sectdata);
+            self.sectdata = Some((name.to_string(), sectdata));
             return Ok(self);
         }
 
@@ -806,7 +806,7 @@ impl Macho {
         self.header.ncmds += 1;
         self.header.sizeofcmds += self.seg.cmdsize;
 
-        self.sectdata = Some(sectdata);
+        self.sectdata = Some((name.to_string(), sectdata));
         Ok(self)
     }
 
@@ -815,20 +815,12 @@ impl Macho {
         if self.header.cputype != CPU_TYPE_ARM_64 {
             let mut data = self.data;
 
-            if let Some(sectdata) = self.sectdata {
-                // Construct sentinel from reversed string to prevent it from existing as contiguous
-                // bytes in the binary. Use black_box to prevent compiler from const-evaluating.
-                let mut sentinel = Vec::with_capacity(16);
-                let reversed = std::hint::black_box(b">~atad-ius~<"); // "<~sui-data~>" reversed
-                for &byte in reversed.iter().rev() {
-                    sentinel.push(byte);
-                }
-                // Add magic bytes in reverse order with black_box
-                let magic = std::hint::black_box([0xEF, 0xBE, 0xAD, 0xDE]);
-                sentinel.extend_from_slice(&magic);
-                data.extend_from_slice(&sentinel);
-                data.extend_from_slice(&(sectdata.len() as u64).to_le_bytes());
-                data.extend_from_slice(&sectdata);
+            if let Some((name, sectdata)) = self.sectdata {
+                // Append a name-aware trailer to the end of the binary. Chained
+                // trailers from earlier libsui calls (e.g. a `dnclbk` blob
+                // appended by the deno release pipeline) remain intact inside
+                // `data` — `find_section` walks backwards through them.
+                intel_mac::append_trailer(&mut data, &name, &sectdata);
             }
 
             intel_mac::patch_macho_executable(&mut data);
@@ -859,7 +851,7 @@ impl Macho {
 
         off += len;
 
-        if let Some(sectdata) = self.sectdata {
+        if let Some((_, sectdata)) = self.sectdata {
             writer.write_all(&sectdata)?;
             if self.seg.filesize > sectdata.len() as u64 {
                 let padding = vec![0; (self.seg.filesize - sectdata.len() as u64) as usize];
@@ -938,7 +930,7 @@ mod macho {
     pub fn find_section(_section_name: &str) -> std::io::Result<Option<&[u8]>> {
         #[cfg(target_arch = "x86_64")]
         {
-            super::intel_mac::find_section()
+            super::intel_mac::find_section(_section_name)
         }
 
         #[cfg(not(target_arch = "x86_64"))]
