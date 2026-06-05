@@ -206,8 +206,15 @@ pub fn patch_macho_executable(file: &mut [u8]) -> bool {
         let cmd_type = read_u32_le(file, offset);
         offset += 4;
 
-        let size = read_u32_le(file, offset) as usize - 8;
+        // A load command header is 8 bytes: a u32 `cmd` followed by a u32
+        // `cmdsize`. A `cmdsize` smaller than the header is malformed, so
+        // reject it instead of underflowing when computing the body size.
+        let cmdsize = read_u32_le(file, offset) as usize;
         offset += 4;
+        if cmdsize < 8 {
+            return false;
+        }
+        let size = cmdsize - 8;
 
         if offset + size > file.len() {
             return false;
@@ -267,6 +274,21 @@ mod tests {
     #[test]
     fn test_patch_macho_executable_invalid() {
         let mut buf = vec![0u8; 10];
+        assert_eq!(patch_macho_executable(&mut buf), false);
+    }
+
+    #[test]
+    fn test_patch_macho_executable_malformed_cmdsize() {
+        // Header is 32 bytes; reserve room for one load command header plus a
+        // little extra so the only thing wrong is the `cmdsize` value.
+        let mut buf = vec![0u8; 64];
+        // ncmds = 1
+        write_u32_le(&mut buf, 16, 1);
+        // First load command at offset 32: cmd = LC_SEGMENT_64 (0x19),
+        // cmdsize = 4 which is smaller than the 8-byte command header.
+        write_u32_le(&mut buf, 32, 0x19);
+        write_u32_le(&mut buf, 36, 4);
+        // Must reject the malformed command rather than underflowing.
         assert_eq!(patch_macho_executable(&mut buf), false);
     }
 }
