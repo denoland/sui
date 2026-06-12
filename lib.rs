@@ -1202,15 +1202,25 @@ impl<'a> Elf<'a> {
 
         {
             let section = builder.sections.get_mut(section_id);
-            let align = if let Some(load_segment_id) = load_segment_id {
+            // The note's virtual address is derived from its file offset (see
+            // `sh_addr` below). That stays consistent only if the file offset is
+            // past the carrier segment's whole *memory* image: a trailing
+            // SHT_NOBITS section (.bss) makes `p_memsz` exceed `p_filesz`, so
+            // placing the note right after the file bytes would give it a
+            // virtual address that overlaps .bss. Mapped at the same address as
+            // the program's zero-initialized data, the note gets clobbered (and
+            // .bss corrupted by the note bytes) at startup. Push the file offset
+            // past `p_offset + p_memsz` so the derived address always clears .bss.
+            let (align, min_offset) = if let Some(load_segment_id) = load_segment_id {
                 let seg = builder.segments.get(load_segment_id);
-                (seg.p_align as usize)
+                let align = (seg.p_align as usize)
                     .max(section.sh_addralign as usize)
-                    .max(1)
+                    .max(1);
+                (align, (seg.p_offset + seg.p_memsz) as usize)
             } else {
-                (section.sh_addralign as usize).max(1)
+                ((section.sh_addralign as usize).max(1), 0)
             };
-            section.sh_offset = align_up(max_end as usize, align) as u64;
+            section.sh_offset = align_up((max_end as usize).max(min_offset), align) as u64;
             section.sh_addr = if let Some(load_segment_id) = load_segment_id {
                 let seg = builder.segments.get(load_segment_id);
                 seg.p_vaddr + (section.sh_offset - seg.p_offset)

@@ -294,6 +294,119 @@ fn test_elf_note_mapped_and_preserves() {
     assert!(has_sui, "expected SUI note to be appended");
 }
 
+/// Return a copy of `input` whose largest non-TLS `.bss` (`SHT_NOBITS`) and
+/// its carrier `PT_LOAD` are grown by `extra` bytes of *memory* (no file
+/// bytes). This widens the gap between the carrier segment's file image
+/// (`p_filesz`) and memory image (`p_memsz`), the condition under which the
+/// note-placement math matters.
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn inflate_bss(input: &[u8], extra: u64) -> Vec<u8> {
+    use object::build::elf as e;
+
+    let mut builder = e::Builder::read(input).expect("parse fixture ELF");
+
+    let bss_id = builder
+        .sections
+        .iter()
+        .filter(|s| {
+            s.sh_type == object::elf::SHT_NOBITS
+                && s.sh_flags & object::elf::SHF_ALLOC as u64 != 0
+                && s.sh_flags & object::elf::SHF_TLS as u64 == 0
+        })
+        .max_by_key(|s| s.sh_addr)
+        .map(|s| s.id())
+        .expect("fixture has a .bss");
+    {
+        // `.bss` size is carried by `SectionData::UninitializedData`, which
+        // `set_section_sizes` recomputes `sh_size` from — bump the data, not
+        // just `sh_size`, or the change is undone on write.
+        let bss = builder.sections.get_mut(bss_id);
+        let new_size = bss.sh_size + extra;
+        bss.sh_size = new_size;
+        bss.data = e::SectionData::UninitializedData(new_size);
+    }
+
+    let seg_id = builder
+        .segments
+        .iter()
+        .filter(|s| s.is_load())
+        .max_by_key(|s| s.p_offset + s.p_filesz)
+        .map(|s| s.id())
+        .expect("fixture has a load segment");
+    builder.segments.get_mut(seg_id).p_memsz += extra;
+
+    let mut out = Vec::new();
+    builder.write(&mut out).expect("write inflated fixture");
+    out
+}
+
+/// Regression test for the `.bss`/`.note.sui` overlap bug.
+///
+/// `append` placed `.note.sui` at a virtual address derived from its file
+/// offset, ignoring that a trailing `.bss` (`SHT_NOBITS`) makes the carrier
+/// segment's memory image larger than its file image. With a large enough
+/// `.bss` the note's mapped range landed *inside* `.bss`, so the program's
+/// zero-initialized globals aliased the embedded data — corrupting it (and
+/// `.bss`) at startup. The note's memory range must not overlap any allocated
+/// section.
+#[cfg(all(unix, not(target_vendor = "apple")))]
+#[test]
+fn test_elf_note_does_not_overlap_bss() {
+    use object::endian::Endianness;
+    use object::read::elf::{ElfFile64, SectionHeader};
+
+    let _lock = PROCESS_LOCK.lock().unwrap();
+
+    let fixture = std::fs::read("tests/exec_elf64").unwrap();
+    // 256 KiB of extra .bss — well past a page, so the buggy placement would
+    // overlap.
+    let input = inflate_bss(&fixture, 0x40000);
+
+    let payload = b"no-bss-overlap".to_vec();
+    let mut out = Vec::new();
+    Elf::new(&input)
+        .append(RESOURCE_NAME, &payload, &mut out)
+        .unwrap();
+
+    let elf_file = ElfFile64::<Endianness, _>::parse(&out[..]).unwrap();
+    let endian = elf_file.endian();
+    let section_table = elf_file.elf_section_table();
+
+    let (_, note) = section_table
+        .section_by_name(endian, b".note.sui")
+        .expect(".note.sui section missing");
+    let note_addr = note.sh_addr(endian);
+    let note_end = note_addr + note.sh_size(endian);
+    assert!(note_end > note_addr, ".note.sui is empty");
+
+    for section in section_table.iter() {
+        if section.sh_flags(endian) & object::elf::SHF_ALLOC as u64 == 0 {
+            continue;
+        }
+        let name = section_table.section_name(endian, section).unwrap_or(b"");
+        if name == b".note.sui" {
+            continue;
+        }
+        let addr = section.sh_addr(endian);
+        let size = section.sh_size(endian);
+        if size == 0 {
+            continue;
+        }
+        assert!(
+            note_addr >= addr + size || addr >= note_end,
+            "note [{note_addr:#x}, {note_end:#x}) overlaps section {} [{addr:#x}, {:#x})",
+            String::from_utf8_lossy(name),
+            addr + size,
+        );
+    }
+
+    // The embedded payload is still recoverable through the public reader.
+    assert_eq!(
+        find_section_in_bytes(&out, RESOURCE_NAME).unwrap(),
+        payload.as_slice()
+    );
+}
+
 #[cfg(all(unix, not(target_vendor = "apple")))]
 fn find_section_in_bytes<'a>(data: &'a [u8], name: &str) -> Option<&'a [u8]> {
     use object::endian::Endianness;
