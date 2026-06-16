@@ -593,3 +593,83 @@ fn test_cross_platform_intel_mac_injection() {
     assert!(!output.is_empty());
     assert!(utils::is_macho(&output));
 }
+
+/// Regression test for the ELF note append: the rewrite must preserve every
+/// original byte of the file (so relocations such as `.relr.dyn`, and any
+/// segment bytes not covered by a surviving section, survive unchanged) and
+/// must not touch the section header table. It must also leave the note
+/// discoverable via a PT_NOTE program header. See the `Elf::append` docs.
+#[test]
+fn test_elf_append_preserves_original_bytes() {
+    let _lock = PROCESS_LOCK.lock().unwrap();
+
+    let input = std::fs::read("tests/exec_elf64").unwrap();
+    let data = vec![0x42u8; 4096];
+
+    let mut out = Vec::new();
+    Elf::new(&input)
+        .append(RESOURCE_NAME, &data, &mut out)
+        .unwrap();
+
+    assert!(utils::is_elf(&out));
+
+    // Everything past the 64-byte ELF header is preserved verbatim: section
+    // headers, segment contents, and all relocations survive untouched. Only
+    // e_phoff/e_phnum in the header are repointed at the enlarged table.
+    assert!(out.len() >= input.len());
+    assert_eq!(&out[64..input.len()], &input[64..], "original bytes mutated");
+
+    let r64 = |b: &[u8]| u64::from_le_bytes(b[..8].try_into().unwrap());
+    let r16 = |b: &[u8]| u16::from_le_bytes(b[..2].try_into().unwrap());
+
+    // The section header table location/size is untouched.
+    assert_eq!(r64(&out[0x28..0x30]), r64(&input[0x28..0x30]), "e_shoff changed");
+    assert_eq!(r16(&out[0x3c..0x3e]), r16(&input[0x3c..0x3e]), "e_shnum changed");
+
+    // Program header table grew by exactly two entries (PT_LOAD + PT_NOTE).
+    assert_eq!(
+        r16(&out[0x38..0x3a]),
+        r16(&input[0x38..0x3a]) + 2,
+        "e_phnum did not grow by 2"
+    );
+
+    // Walk the (relocated) program headers and confirm a PT_NOTE points at a
+    // SUI note whose payload round-trips back to what we appended.
+    let e_phoff = r64(&out[0x20..0x28]) as usize;
+    let e_phentsize = r16(&out[0x36..0x38]) as usize;
+    let e_phnum = r16(&out[0x38..0x3a]) as usize;
+
+    let mut found = false;
+    'outer: for i in 0..e_phnum {
+        let p = &out[e_phoff + i * e_phentsize..];
+        if u32::from_le_bytes(p[0..4].try_into().unwrap()) != 4 /* PT_NOTE */ {
+            continue;
+        }
+        let off = r64(&p[8..16]) as usize;
+        let filesz = r64(&p[32..40]) as usize;
+        let seg = &out[off..off + filesz];
+        // Parse notes in this segment.
+        let mut pos = 0usize;
+        while pos + 12 <= seg.len() {
+            let namesz = u32::from_le_bytes(seg[pos..pos + 4].try_into().unwrap()) as usize;
+            let descsz = u32::from_le_bytes(seg[pos + 4..pos + 8].try_into().unwrap()) as usize;
+            pos += 12;
+            let mut nm = &seg[pos..pos + namesz];
+            while let [rest @ .., 0] = nm {
+                nm = rest;
+            }
+            pos = (pos + namesz + 3) & !3;
+            let desc = &seg[pos..pos + descsz];
+            pos = (pos + descsz + 3) & !3;
+            if nm == b"SUI" {
+                // desc = u16 name_len | name | payload
+                let nl = u16::from_le_bytes(desc[0..2].try_into().unwrap()) as usize;
+                assert_eq!(&desc[2..2 + nl], RESOURCE_NAME.as_bytes());
+                assert_eq!(&desc[2 + nl..], &data[..], "note payload mismatch");
+                found = true;
+                break 'outer;
+            }
+        }
+    }
+    assert!(found, "appended SUI note not found via PT_NOTE");
+}
