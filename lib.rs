@@ -1265,19 +1265,25 @@ impl<'a> Elf<'a> {
 
         // Builds one program header entry of `e_phentsize` bytes (trailing
         // bytes, if the entry is larger than 56, stay zeroed).
-        let make_phdr =
-            |p_type: u32, p_flags: u32, p_offset: u64, p_vaddr: u64, p_filesz: u64, p_memsz: u64, p_align: u64| -> Vec<u8> {
-                let mut e = vec![0u8; e_phentsize];
-                w32(&mut e[0..4], p_type);
-                w32(&mut e[4..8], p_flags);
-                w64(&mut e[8..16], p_offset);
-                w64(&mut e[16..24], p_vaddr);
-                w64(&mut e[24..32], p_vaddr); // p_paddr = p_vaddr
-                w64(&mut e[32..40], p_filesz);
-                w64(&mut e[40..48], p_memsz);
-                w64(&mut e[48..56], p_align);
-                e
-            };
+        let make_phdr = |p_type: u32,
+                         p_flags: u32,
+                         p_offset: u64,
+                         p_vaddr: u64,
+                         p_filesz: u64,
+                         p_memsz: u64,
+                         p_align: u64|
+         -> Vec<u8> {
+            let mut e = vec![0u8; e_phentsize];
+            w32(&mut e[0..4], p_type);
+            w32(&mut e[4..8], p_flags);
+            w64(&mut e[8..16], p_offset);
+            w64(&mut e[16..24], p_vaddr);
+            w64(&mut e[24..32], p_vaddr); // p_paddr = p_vaddr
+            w64(&mut e[32..40], p_filesz);
+            w64(&mut e[40..48], p_memsz);
+            w64(&mut e[48..56], p_align);
+            e
+        };
 
         // New program header table = verbatim copy of the originals + the two
         // new segments. Copying raw preserves any per-entry padding.

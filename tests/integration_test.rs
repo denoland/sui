@@ -233,65 +233,62 @@ fn test_elf_note_mapped_and_preserves() {
     elf.append(RESOURCE_NAME, &payload, &mut out).unwrap();
 
     use object::endian::Endianness;
-    use object::read::elf::{ElfFile64, FileHeader, ProgramHeader, SectionHeader};
+    use object::read::elf::{ElfFile64, FileHeader, ProgramHeader};
 
     let elf_file = ElfFile64::<Endianness, _>::parse(&out[..]).unwrap();
     let endian = elf_file.endian();
-
-    let section_table = elf_file.elf_section_table();
-    let (_, note_section) = section_table
-        .section_by_name(endian, b".note.sui")
-        .expect(".note.sui section missing");
-
-    let sh_offset: u64 = note_section.sh_offset(endian).into();
-    let sh_size: u64 = note_section.sh_size(endian).into();
-    assert!(sh_size > 0, ".note.sui is empty");
-
     let header = elf_file.elf_header();
     let segments = header.program_headers(endian, &out[..]).unwrap();
 
-    let mut load_covers = false;
-    let mut note_segment_matches = false;
+    // The SUI note is carried by its own PT_NOTE program header (not a
+    // section), whose mapped range must fall entirely within a PT_LOAD so the
+    // runtime `dl_iterate_phdr` scan can read it.
+    let mut sui_note_segment = None;
+    let mut has_gnu = false;
     for segment in segments {
-        let p_type = segment.p_type(endian);
+        let Ok(Some(mut notes)) = segment.notes(endian, &out[..]) else {
+            continue;
+        };
+        while let Ok(Some(note)) = notes.next() {
+            let name = trim_note_name(note.name());
+            if name == b"GNU" {
+                has_gnu = true;
+            } else if name == b"SUI" {
+                sui_note_segment = Some((
+                    segment.p_offset(endian).into(),
+                    segment.p_filesz(endian).into(),
+                    segment.p_vaddr(endian).into(),
+                    segment.p_memsz(endian).into(),
+                ));
+            }
+        }
+    }
+
+    let (note_off, note_filesz, note_vaddr, note_memsz): (u64, u64, u64, u64) =
+        sui_note_segment.expect("PT_NOTE carrying the SUI note missing");
+    assert!(note_filesz > 0, "SUI note is empty");
+
+    let segments = header.program_headers(endian, &out[..]).unwrap();
+    let mut load_covers = false;
+    for segment in segments {
+        if segment.p_type(endian) != object::elf::PT_LOAD {
+            continue;
+        }
         let p_offset: u64 = segment.p_offset(endian).into();
         let p_filesz: u64 = segment.p_filesz(endian).into();
-
-        if p_type == object::elf::PT_LOAD {
-            if sh_offset >= p_offset && sh_offset + sh_size <= p_offset + p_filesz {
-                load_covers = true;
-            }
-        }
-        if p_type == object::elf::PT_NOTE {
-            if sh_offset == p_offset && sh_size == p_filesz {
-                note_segment_matches = true;
-            }
+        let p_vaddr: u64 = segment.p_vaddr(endian).into();
+        let p_memsz: u64 = segment.p_memsz(endian).into();
+        if note_off >= p_offset
+            && note_off + note_filesz <= p_offset + p_filesz
+            && note_vaddr >= p_vaddr
+            && note_vaddr + note_memsz <= p_vaddr + p_memsz
+        {
+            load_covers = true;
         }
     }
 
-    assert!(load_covers, ".note.sui is not mapped by a PT_LOAD segment");
-    assert!(
-        note_segment_matches,
-        "PT_NOTE segment does not point at .note.sui"
-    );
-
-    let Ok(Some(mut notes)) = note_section.notes(endian, &out[..]) else {
-        panic!("failed to read notes from .note.sui");
-    };
-
-    let mut has_gnu = false;
-    let mut has_sui = false;
-    while let Ok(Some(note)) = notes.next() {
-        let name = trim_note_name(note.name());
-        if name == b"GNU" {
-            has_gnu = true;
-        } else if name == b"SUI" {
-            has_sui = true;
-        }
-    }
-
+    assert!(load_covers, "SUI note is not mapped by a PT_LOAD segment");
     assert!(has_gnu, "expected GNU note to be preserved");
-    assert!(has_sui, "expected SUI note to be appended");
 }
 
 /// Return a copy of `input` whose largest non-TLS `.bss` (`SHT_NOBITS`) and
@@ -353,7 +350,7 @@ fn inflate_bss(input: &[u8], extra: u64) -> Vec<u8> {
 #[test]
 fn test_elf_note_does_not_overlap_bss() {
     use object::endian::Endianness;
-    use object::read::elf::{ElfFile64, SectionHeader};
+    use object::read::elf::{ElfFile64, FileHeader, ProgramHeader, SectionHeader};
 
     let _lock = PROCESS_LOCK.lock().unwrap();
 
@@ -370,14 +367,28 @@ fn test_elf_note_does_not_overlap_bss() {
 
     let elf_file = ElfFile64::<Endianness, _>::parse(&out[..]).unwrap();
     let endian = elf_file.endian();
-    let section_table = elf_file.elf_section_table();
 
-    let (_, note) = section_table
-        .section_by_name(endian, b".note.sui")
-        .expect(".note.sui section missing");
-    let note_addr = note.sh_addr(endian);
-    let note_end = note_addr + note.sh_size(endian);
-    assert!(note_end > note_addr, ".note.sui is empty");
+    // The note lives in its own PT_NOTE program header; its mapped memory range
+    // must clear every allocated section (notably the inflated .bss).
+    let header = elf_file.elf_header();
+    let segments = header.program_headers(endian, &out[..]).unwrap();
+    let mut note_range = None;
+    for segment in segments {
+        let Ok(Some(mut notes)) = segment.notes(endian, &out[..]) else {
+            continue;
+        };
+        while let Ok(Some(note)) = notes.next() {
+            if trim_note_name(note.name()) == b"SUI" {
+                let addr: u64 = segment.p_vaddr(endian).into();
+                let size: u64 = segment.p_memsz(endian).into();
+                note_range = Some((addr, addr + size));
+            }
+        }
+    }
+    let (note_addr, note_end) = note_range.expect("PT_NOTE carrying the SUI note missing");
+    assert!(note_end > note_addr, "SUI note is empty");
+
+    let section_table = elf_file.elf_section_table();
 
     for section in section_table.iter() {
         if section.sh_flags(endian) & object::elf::SHF_ALLOC as u64 == 0 {
@@ -415,6 +426,10 @@ fn find_section_in_bytes<'a>(data: &'a [u8], name: &str) -> Option<&'a [u8]> {
     let elf_file = ElfFile64::<Endianness, _>::parse(data).ok()?;
     let endian = elf_file.endian();
 
+    // `append` adds the note via a PT_NOTE program header, not a section, so
+    // it is discoverable even after the section table is stripped — scan the
+    // section table first (if any), then fall back to program headers, mirroring
+    // the runtime `find_section` which uses `dl_iterate_phdr`.
     let section_table = elf_file.elf_section_table();
     if !section_table.is_empty() {
         for section in section_table.iter() {
@@ -433,7 +448,6 @@ fn find_section_in_bytes<'a>(data: &'a [u8], name: &str) -> Option<&'a [u8]> {
                 }
             }
         }
-        return None;
     }
 
     let header = elf_file.elf_header();
@@ -617,14 +631,26 @@ fn test_elf_append_preserves_original_bytes() {
     // headers, segment contents, and all relocations survive untouched. Only
     // e_phoff/e_phnum in the header are repointed at the enlarged table.
     assert!(out.len() >= input.len());
-    assert_eq!(&out[64..input.len()], &input[64..], "original bytes mutated");
+    assert_eq!(
+        &out[64..input.len()],
+        &input[64..],
+        "original bytes mutated"
+    );
 
     let r64 = |b: &[u8]| u64::from_le_bytes(b[..8].try_into().unwrap());
     let r16 = |b: &[u8]| u16::from_le_bytes(b[..2].try_into().unwrap());
 
     // The section header table location/size is untouched.
-    assert_eq!(r64(&out[0x28..0x30]), r64(&input[0x28..0x30]), "e_shoff changed");
-    assert_eq!(r16(&out[0x3c..0x3e]), r16(&input[0x3c..0x3e]), "e_shnum changed");
+    assert_eq!(
+        r64(&out[0x28..0x30]),
+        r64(&input[0x28..0x30]),
+        "e_shoff changed"
+    );
+    assert_eq!(
+        r16(&out[0x3c..0x3e]),
+        r16(&input[0x3c..0x3e]),
+        "e_shnum changed"
+    );
 
     // Program header table grew by exactly two entries (PT_LOAD + PT_NOTE).
     assert_eq!(
@@ -642,7 +668,9 @@ fn test_elf_append_preserves_original_bytes() {
     let mut found = false;
     'outer: for i in 0..e_phnum {
         let p = &out[e_phoff + i * e_phentsize..];
-        if u32::from_le_bytes(p[0..4].try_into().unwrap()) != 4 /* PT_NOTE */ {
+        if u32::from_le_bytes(p[0..4].try_into().unwrap()) != 4
+        /* PT_NOTE */
+        {
             continue;
         }
         let off = r64(&p[8..16]) as usize;
