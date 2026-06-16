@@ -1323,9 +1323,88 @@ impl<'a> Elf<'a> {
         out.resize(note_file_off, 0);
         out.extend_from_slice(&note);
 
-        // Point the ELF header at the relocated, enlarged program header table.
+        // If the input still has a section header table, add a real allocated
+        // SHT_NOTE section for the note as well. The PT_NOTE above is what the
+        // runtime reads, but a section is what `strip` (and other BFD-based
+        // tools, which rebuild the file from its sections) preserve — without
+        // it a later strip would discard the note bytes. A fully stripped
+        // binary has no section table to extend, and keeps the note via
+        // PT_NOTE alone.
+        const SHENTSIZE64: usize = 64;
+        const SHT_NOTE: u32 = 7;
+        const SHF_ALLOC: u64 = 2;
+        const SHN_XINDEX: usize = 0xffff;
+
+        let e_shoff = r64(&data[0x28..0x30]) as usize;
+        let e_shentsize = r16(&data[0x3a..0x3c]) as usize;
+        let e_shnum = r16(&data[0x3c..0x3e]) as usize;
+        let e_shstrndx = r16(&data[0x3e..0x40]) as usize;
+
+        let mut new_shoff = e_shoff as u64;
+        let mut new_shnum = e_shnum as u16;
+
+        let shstr_range = (e_shoff != 0
+            && e_shentsize >= SHENTSIZE64
+            && e_shnum != 0
+            && e_shstrndx != 0
+            && e_shstrndx < e_shnum
+            && e_shstrndx != SHN_XINDEX
+            && e_shoff
+                .checked_add(e_shnum * e_shentsize)
+                .map(|end| end <= data.len())
+                .unwrap_or(false))
+        .then(|| {
+            let hdr = &data[e_shoff + e_shstrndx * e_shentsize..];
+            (r64(&hdr[24..32]) as usize, r64(&hdr[32..40]) as usize)
+        })
+        .filter(|&(off, size)| {
+            off.checked_add(size)
+                .map(|end| end <= data.len())
+                .unwrap_or(false)
+        });
+
+        if let Some((shstr_off, shstr_size)) = shstr_range {
+            // Relocate and grow .shstrtab so it carries the new section name.
+            let mut new_shstr = data[shstr_off..shstr_off + shstr_size].to_vec();
+            let name_index = new_shstr.len() as u32;
+            new_shstr.extend_from_slice(b".note.sui\0");
+
+            // .shstrtab and the section header table are non-allocated
+            // metadata: place them past the note, outside the new PT_LOAD.
+            let shstr_new_off = out.len();
+            out.extend_from_slice(&new_shstr);
+            let sht_new_off = align_up(out.len(), 8);
+            out.resize(sht_new_off, 0);
+
+            // Copy the original section headers, repoint the relocated
+            // .shstrtab entry, then append the .note.sui section header.
+            let mut sht = data[e_shoff..e_shoff + e_shnum * e_shentsize].to_vec();
+            {
+                let e = &mut sht[e_shstrndx * e_shentsize..e_shstrndx * e_shentsize + SHENTSIZE64];
+                w64(&mut e[24..32], shstr_new_off as u64);
+                w64(&mut e[32..40], new_shstr.len() as u64);
+            }
+            let mut note_sh = vec![0u8; e_shentsize];
+            w32(&mut note_sh[0..4], name_index); // sh_name
+            w32(&mut note_sh[4..8], SHT_NOTE); // sh_type
+            w64(&mut note_sh[8..16], SHF_ALLOC); // sh_flags
+            w64(&mut note_sh[16..24], note_vaddr); // sh_addr
+            w64(&mut note_sh[24..32], note_file_off as u64); // sh_offset
+            w64(&mut note_sh[32..40], note.len() as u64); // sh_size
+            w64(&mut note_sh[48..56], 4); // sh_addralign
+            sht.extend_from_slice(&note_sh);
+            out.extend_from_slice(&sht);
+
+            new_shoff = sht_new_off as u64;
+            new_shnum = (e_shnum + 1) as u16;
+        }
+
+        // Point the ELF header at the relocated, enlarged program header table
+        // (and section header table, if one was added).
         w64(&mut out[0x20..0x28], new_phoff as u64);
         w16(&mut out[0x38..0x3a], new_phnum as u16);
+        w64(&mut out[0x28..0x30], new_shoff);
+        w16(&mut out[0x3c..0x3e], new_shnum);
 
         writer.write_all(&out)?;
         Ok(())

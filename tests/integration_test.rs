@@ -610,9 +610,11 @@ fn test_cross_platform_intel_mac_injection() {
 
 /// Regression test for the ELF note append: the rewrite must preserve every
 /// original byte of the file (so relocations such as `.relr.dyn`, and any
-/// segment bytes not covered by a surviving section, survive unchanged) and
-/// must not touch the section header table. It must also leave the note
-/// discoverable via a PT_NOTE program header. See the `Elf::append` docs.
+/// segment bytes not covered by a surviving section, survive unchanged). Only
+/// the ELF header's table pointers are repointed; the original program and
+/// section header tables are copied (enlarged) past EOF, never edited in
+/// place. It must also leave the note discoverable via a PT_NOTE program
+/// header. See the `Elf::append` docs.
 #[test]
 fn test_elf_append_preserves_original_bytes() {
     let _lock = PROCESS_LOCK.lock().unwrap();
@@ -627,9 +629,10 @@ fn test_elf_append_preserves_original_bytes() {
 
     assert!(utils::is_elf(&out));
 
-    // Everything past the 64-byte ELF header is preserved verbatim: section
-    // headers, segment contents, and all relocations survive untouched. Only
-    // e_phoff/e_phnum in the header are repointed at the enlarged table.
+    // Everything past the 64-byte ELF header is preserved verbatim: the
+    // original program/section header tables, segment contents, and all
+    // relocations survive untouched. Only the header's table pointers
+    // (e_phoff/e_phnum, e_shoff/e_shnum) are updated.
     assert!(out.len() >= input.len());
     assert_eq!(
         &out[64..input.len()],
@@ -640,16 +643,16 @@ fn test_elf_append_preserves_original_bytes() {
     let r64 = |b: &[u8]| u64::from_le_bytes(b[..8].try_into().unwrap());
     let r16 = |b: &[u8]| u16::from_le_bytes(b[..2].try_into().unwrap());
 
-    // The section header table location/size is untouched.
-    assert_eq!(
-        r64(&out[0x28..0x30]),
-        r64(&input[0x28..0x30]),
-        "e_shoff changed"
+    // A real allocated .note.sui section was added, so the section header
+    // table was relocated (past EOF) and grew by exactly one entry.
+    assert!(
+        r64(&out[0x28..0x30]) >= input.len() as u64,
+        "section header table not relocated past the original image"
     );
     assert_eq!(
         r16(&out[0x3c..0x3e]),
-        r16(&input[0x3c..0x3e]),
-        "e_shnum changed"
+        r16(&input[0x3c..0x3e]) + 1,
+        "e_shnum did not grow by 1"
     );
 
     // Program header table grew by exactly two entries (PT_LOAD + PT_NOTE).
