@@ -75,8 +75,6 @@ use editpe::{
     ResourceData, ResourceEntry, ResourceEntryName, ResourceTable,
 };
 use image::{imageops::FilterType::Lanczos3, ImageFormat, ImageReader};
-use object::endian::Endianness;
-use object::read::elf::{FileHeader, ProgramHeader};
 use std::io::Cursor;
 use std::io::Write;
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
@@ -1126,162 +1124,288 @@ impl<'a> Elf<'a> {
         Self { data }
     }
 
+    /// Append `sectdata` to the ELF as a `.note.sui` note, leaving every
+    /// original byte of the file untouched.
+    ///
+    /// The previous implementation round-tripped the whole binary through
+    /// `object::build::elf::Builder`, which rebuilds the file purely from its
+    /// section table. That is lossy for modern relocatable executables:
+    /// `object` (0.36) has no `SHT_RELR` support, and any segment bytes not
+    /// covered by a surviving section (e.g. `.relr.dyn` relative relocations
+    /// in a binary whose section headers have been stripped) are silently
+    /// dropped — leaving startup relocations un-applied and the program
+    /// deadlocking in C++ static-init guards.
+    ///
+    /// Instead we keep the original image verbatim and graft the note on the
+    /// end, in the style of `patchelf --add-note`:
+    ///   1. Append the note payload and a fresh, enlarged copy of the program
+    ///      header table at a page-aligned offset past EOF.
+    ///   2. Add a `PT_LOAD` that maps that appended region, and a `PT_NOTE`
+    ///      that points at the note within it, so `find_section`'s
+    ///      `dl_iterate_phdr` scan can see it at runtime.
+    ///   3. Repoint `e_phoff`/`e_phnum` (and `PT_PHDR`, if present) at the new
+    ///      table. The section header table is never touched, so relocations,
+    ///      `.relr.dyn`, and everything else survive unchanged.
     pub fn append<W: Write>(
         &self,
         name: &str,
         sectdata: &[u8],
         writer: &mut W,
     ) -> Result<(), Error> {
-        use object::build::elf as e;
-        let note_data = build_elf_note_payload(name, sectdata);
+        const PAGE: usize = 0x1000;
+        // Program/segment header type and flag constants (ELF64).
+        const PT_LOAD: u32 = 1;
+        const PT_NOTE: u32 = 4;
+        const PT_PHDR: u32 = 6;
+        const PF_R: u32 = 4;
+        const PHENTSIZE64: usize = 56;
 
-        // Existing PT_NOTE section headers are not preserved; their contents are copied into
-        // `.note.sui` instead
-        let combined_note_data = {
-            let existing = object::read::elf::ElfFile64::<Endianness, _>::parse(self.data)
-                .ok()
-                .and_then(|elf_file| {
-                    let endian = elf_file.endian();
-                    let header = elf_file.elf_header();
-                    let segments = header.program_headers(endian, self.data).ok()?;
-                    for segment in segments {
-                        if segment.p_type(endian) != object::elf::PT_NOTE {
-                            continue;
-                        }
-                        let data = segment.data(endian, self.data).ok()?;
-                        if !data.is_empty() {
-                            return Some(data);
-                        }
-                    }
-                    None
-                });
-            if let Some(existing) = existing {
-                let mut combined = Vec::with_capacity(existing.len() + note_data.len());
-                combined.extend_from_slice(existing);
-                combined.extend_from_slice(&note_data);
-                combined
-            } else {
-                note_data.clone()
-            }
+        let data = self.data;
+        if data.len() < 64 || data[0..4] != *b"\x7fELF" {
+            return Err(Error::InvalidObject("Not an ELF file"));
+        }
+        if data[4] != 2 {
+            return Err(Error::InvalidObject("Only 64-bit ELF is supported"));
+        }
+        let le = match data[5] {
+            1 => true,
+            2 => false,
+            _ => return Err(Error::InvalidObject("Invalid ELF data encoding")),
         };
 
-        let mut builder =
-            e::Builder::read(self.data).map_err(|_| Error::InvalidObject("Failed to parse ELF"))?;
-
-        let section = builder.sections.add();
-        section.name = ".note.sui".into();
-        section.sh_type = object::elf::SHT_NOTE;
-        section.sh_flags = object::elf::SHF_ALLOC as u64;
-        section.sh_addralign = 4;
-        section.data = e::SectionData::Note(combined_note_data.into());
-        let section_id = section.id();
-
-        builder.set_section_sizes();
-
-        let mut max_end = 0u64;
-        for existing in builder.sections.iter() {
-            if existing.delete {
-                continue;
-            }
-            let filesz = if existing.sh_type == object::elf::SHT_NOBITS {
-                0
+        // Endian-aware scalar readers/writers for the header fields we touch.
+        let r16 = |b: &[u8]| -> u16 {
+            let a = [b[0], b[1]];
+            if le {
+                u16::from_le_bytes(a)
             } else {
-                existing.sh_size
-            };
-            let end = existing.sh_offset + filesz;
-            if end > max_end {
-                max_end = end;
+                u16::from_be_bytes(a)
             }
-        }
-        let load_segment_id = builder
-            .segments
-            .iter()
-            .filter(|segment| segment.is_load())
-            .max_by_key(|segment| segment.p_offset + segment.p_filesz)
-            .map(|segment| segment.id());
+        };
+        let r32 = |b: &[u8]| -> u32 {
+            let a = [b[0], b[1], b[2], b[3]];
+            if le {
+                u32::from_le_bytes(a)
+            } else {
+                u32::from_be_bytes(a)
+            }
+        };
+        let r64 = |b: &[u8]| -> u64 {
+            let mut a = [0u8; 8];
+            a.copy_from_slice(&b[..8]);
+            if le {
+                u64::from_le_bytes(a)
+            } else {
+                u64::from_be_bytes(a)
+            }
+        };
+        let w16 = |b: &mut [u8], v: u16| {
+            let a = if le { v.to_le_bytes() } else { v.to_be_bytes() };
+            b[..2].copy_from_slice(&a);
+        };
+        let w32 = |b: &mut [u8], v: u32| {
+            let a = if le { v.to_le_bytes() } else { v.to_be_bytes() };
+            b[..4].copy_from_slice(&a);
+        };
+        let w64 = |b: &mut [u8], v: u64| {
+            let a = if le { v.to_le_bytes() } else { v.to_be_bytes() };
+            b[..8].copy_from_slice(&a);
+        };
 
+        let e_phoff = r64(&data[0x20..0x28]) as usize;
+        let e_phentsize = r16(&data[0x36..0x38]) as usize;
+        let e_phnum = r16(&data[0x38..0x3a]) as usize;
+
+        if e_phentsize < PHENTSIZE64 {
+            return Err(Error::InvalidObject("Unexpected program header size"));
+        }
+        if e_phnum == 0
+            || e_phoff == 0
+            || e_phoff
+                .checked_add(e_phnum * e_phentsize)
+                .map(|end| end > data.len())
+                .unwrap_or(true)
         {
-            let section = builder.sections.get_mut(section_id);
-            // The note's virtual address is derived from its file offset (see
-            // `sh_addr` below). That stays consistent only if the file offset is
-            // past the carrier segment's whole *memory* image: a trailing
-            // SHT_NOBITS section (.bss) makes `p_memsz` exceed `p_filesz`, so
-            // placing the note right after the file bytes would give it a
-            // virtual address that overlaps .bss. Mapped at the same address as
-            // the program's zero-initialized data, the note gets clobbered (and
-            // .bss corrupted by the note bytes) at startup. Push the file offset
-            // past `p_offset + p_memsz` so the derived address always clears .bss.
-            let (align, min_offset) = if let Some(load_segment_id) = load_segment_id {
-                let seg = builder.segments.get(load_segment_id);
-                let align = (seg.p_align as usize)
-                    .max(section.sh_addralign as usize)
-                    .max(1);
-                (align, (seg.p_offset + seg.p_memsz) as usize)
-            } else {
-                ((section.sh_addralign as usize).max(1), 0)
-            };
-            section.sh_offset = align_up((max_end as usize).max(min_offset), align) as u64;
-            section.sh_addr = if let Some(load_segment_id) = load_segment_id {
-                let seg = builder.segments.get(load_segment_id);
-                seg.p_vaddr + (section.sh_offset - seg.p_offset)
-            } else {
-                0
-            };
+            return Err(Error::InvalidObject("Invalid program header table"));
         }
 
-        if let Some(load_segment_id) = load_segment_id {
-            let section = builder.sections.get_mut(section_id);
-            let seg = builder.segments.get_mut(load_segment_id);
-            let section_end = section.sh_offset + section.sh_size;
-            let mem_end = section.sh_addr + section.sh_size;
-            if section_end > seg.p_offset + seg.p_filesz {
-                seg.p_filesz = section_end - seg.p_offset;
-            }
-            if mem_end > seg.p_vaddr + seg.p_memsz {
-                seg.p_memsz = mem_end - seg.p_vaddr;
-            }
-            if !seg.sections.contains(&section_id) {
-                seg.sections.push(section_id);
+        // Scan existing program headers: find the highest mapped virtual
+        // address (so the note lands above everything) and the PT_PHDR entry.
+        let mut max_vaddr_end = 0u64;
+        let mut pt_phdr_index = None;
+        for i in 0..e_phnum {
+            let off = e_phoff + i * e_phentsize;
+            let p = &data[off..off + PHENTSIZE64];
+            match r32(&p[0..4]) {
+                PT_LOAD => {
+                    let end = r64(&p[16..24]).saturating_add(r64(&p[40..48]));
+                    max_vaddr_end = max_vaddr_end.max(end);
+                }
+                PT_PHDR => pt_phdr_index = Some(i),
+                _ => {}
             }
         }
-
-        let note_segment_id = builder
-            .segments
-            .iter()
-            .find(|segment| segment.p_type == object::elf::PT_NOTE)
-            .map(|segment| segment.id());
-
-        if let Some(note_segment_id) = note_segment_id {
-            let section = builder.sections.get_mut(section_id);
-            let segment = builder.segments.get_mut(note_segment_id);
-            segment.sections.clear();
-            segment.sections.push(section_id);
-            segment.p_type = object::elf::PT_NOTE;
-            segment.p_flags = object::elf::PF_R;
-            segment.p_align = 4;
-            segment.p_offset = section.sh_offset;
-            segment.p_vaddr = section.sh_addr;
-            segment.p_paddr = section.sh_addr;
-            segment.p_filesz = section.sh_size;
-            segment.p_memsz = section.sh_size;
-        } else {
-            let section = builder.sections.get_mut(section_id);
-            let segment = builder.segments.add();
-            segment.p_type = object::elf::PT_NOTE;
-            segment.p_flags = object::elf::PF_R;
-            segment.p_align = 4;
-            segment.p_offset = section.sh_offset;
-            segment.p_vaddr = section.sh_addr;
-            segment.p_paddr = section.sh_addr;
-            segment.p_filesz = section.sh_size;
-            segment.p_memsz = section.sh_size;
-            segment.sections.push(section_id);
+        if max_vaddr_end == 0 {
+            return Err(Error::InvalidObject("No PT_LOAD segments"));
         }
 
-        let mut out = Vec::new();
-        builder
-            .write(&mut out)
-            .map_err(|err| Error::IoError(std::io::Error::other(err)))?;
+        let note = build_elf_note_payload(name, sectdata);
+
+        // Layout of the appended region, all within one new PT_LOAD:
+        //   [page-aligned] new program header table | note
+        // File offset and virtual address are both page-aligned, so they are
+        // congruent mod p_align and the loader maps the region correctly.
+        let new_phnum = e_phnum + 2;
+        let phdr_table_size = new_phnum * e_phentsize;
+        let new_phoff = align_up(data.len(), PAGE);
+        let note_file_off = align_up(new_phoff + phdr_table_size, 4);
+        let load_vaddr = align_up(max_vaddr_end as usize, PAGE) as u64;
+        let note_vaddr = load_vaddr + (note_file_off - new_phoff) as u64;
+        let region_filesz = (note_file_off + note.len() - new_phoff) as u64;
+
+        // Builds one program header entry of `e_phentsize` bytes (trailing
+        // bytes, if the entry is larger than 56, stay zeroed).
+        let make_phdr = |p_type: u32,
+                         p_flags: u32,
+                         p_offset: u64,
+                         p_vaddr: u64,
+                         p_filesz: u64,
+                         p_memsz: u64,
+                         p_align: u64|
+         -> Vec<u8> {
+            let mut e = vec![0u8; e_phentsize];
+            w32(&mut e[0..4], p_type);
+            w32(&mut e[4..8], p_flags);
+            w64(&mut e[8..16], p_offset);
+            w64(&mut e[16..24], p_vaddr);
+            w64(&mut e[24..32], p_vaddr); // p_paddr = p_vaddr
+            w64(&mut e[32..40], p_filesz);
+            w64(&mut e[40..48], p_memsz);
+            w64(&mut e[48..56], p_align);
+            e
+        };
+
+        // New program header table = verbatim copy of the originals + the two
+        // new segments. Copying raw preserves any per-entry padding.
+        let mut table = data[e_phoff..e_phoff + e_phnum * e_phentsize].to_vec();
+        // PT_PHDR, if present, must describe the (relocated) table and lie
+        // inside a PT_LOAD — the new PT_LOAD below covers it.
+        if let Some(i) = pt_phdr_index {
+            let e = &mut table[i * e_phentsize..i * e_phentsize + PHENTSIZE64];
+            w64(&mut e[8..16], new_phoff as u64);
+            w64(&mut e[16..24], load_vaddr);
+            w64(&mut e[24..32], load_vaddr);
+            w64(&mut e[32..40], phdr_table_size as u64);
+            w64(&mut e[40..48], phdr_table_size as u64);
+        }
+        table.extend_from_slice(&make_phdr(
+            PT_LOAD,
+            PF_R,
+            new_phoff as u64,
+            load_vaddr,
+            region_filesz,
+            region_filesz,
+            PAGE as u64,
+        ));
+        table.extend_from_slice(&make_phdr(
+            PT_NOTE,
+            PF_R,
+            note_file_off as u64,
+            note_vaddr,
+            note.len() as u64,
+            note.len() as u64,
+            4,
+        ));
+
+        let mut out = data.to_vec();
+        out.resize(new_phoff, 0);
+        out.extend_from_slice(&table);
+        out.resize(note_file_off, 0);
+        out.extend_from_slice(&note);
+
+        // If the input still has a section header table, add a real allocated
+        // SHT_NOTE section for the note as well. The PT_NOTE above is what the
+        // runtime reads, but a section is what `strip` (and other BFD-based
+        // tools, which rebuild the file from its sections) preserve — without
+        // it a later strip would discard the note bytes. A fully stripped
+        // binary has no section table to extend, and keeps the note via
+        // PT_NOTE alone.
+        const SHENTSIZE64: usize = 64;
+        const SHT_NOTE: u32 = 7;
+        const SHF_ALLOC: u64 = 2;
+        const SHN_XINDEX: usize = 0xffff;
+
+        let e_shoff = r64(&data[0x28..0x30]) as usize;
+        let e_shentsize = r16(&data[0x3a..0x3c]) as usize;
+        let e_shnum = r16(&data[0x3c..0x3e]) as usize;
+        let e_shstrndx = r16(&data[0x3e..0x40]) as usize;
+
+        let mut new_shoff = e_shoff as u64;
+        let mut new_shnum = e_shnum as u16;
+
+        let shstr_range = (e_shoff != 0
+            && e_shentsize >= SHENTSIZE64
+            && e_shnum != 0
+            && e_shstrndx != 0
+            && e_shstrndx < e_shnum
+            && e_shstrndx != SHN_XINDEX
+            && e_shoff
+                .checked_add(e_shnum * e_shentsize)
+                .map(|end| end <= data.len())
+                .unwrap_or(false))
+        .then(|| {
+            let hdr = &data[e_shoff + e_shstrndx * e_shentsize..];
+            (r64(&hdr[24..32]) as usize, r64(&hdr[32..40]) as usize)
+        })
+        .filter(|&(off, size)| {
+            off.checked_add(size)
+                .map(|end| end <= data.len())
+                .unwrap_or(false)
+        });
+
+        if let Some((shstr_off, shstr_size)) = shstr_range {
+            // Relocate and grow .shstrtab so it carries the new section name.
+            let mut new_shstr = data[shstr_off..shstr_off + shstr_size].to_vec();
+            let name_index = new_shstr.len() as u32;
+            new_shstr.extend_from_slice(b".note.sui\0");
+
+            // .shstrtab and the section header table are non-allocated
+            // metadata: place them past the note, outside the new PT_LOAD.
+            let shstr_new_off = out.len();
+            out.extend_from_slice(&new_shstr);
+            let sht_new_off = align_up(out.len(), 8);
+            out.resize(sht_new_off, 0);
+
+            // Copy the original section headers, repoint the relocated
+            // .shstrtab entry, then append the .note.sui section header.
+            let mut sht = data[e_shoff..e_shoff + e_shnum * e_shentsize].to_vec();
+            {
+                let e = &mut sht[e_shstrndx * e_shentsize..e_shstrndx * e_shentsize + SHENTSIZE64];
+                w64(&mut e[24..32], shstr_new_off as u64);
+                w64(&mut e[32..40], new_shstr.len() as u64);
+            }
+            let mut note_sh = vec![0u8; e_shentsize];
+            w32(&mut note_sh[0..4], name_index); // sh_name
+            w32(&mut note_sh[4..8], SHT_NOTE); // sh_type
+            w64(&mut note_sh[8..16], SHF_ALLOC); // sh_flags
+            w64(&mut note_sh[16..24], note_vaddr); // sh_addr
+            w64(&mut note_sh[24..32], note_file_off as u64); // sh_offset
+            w64(&mut note_sh[32..40], note.len() as u64); // sh_size
+            w64(&mut note_sh[48..56], 4); // sh_addralign
+            sht.extend_from_slice(&note_sh);
+            out.extend_from_slice(&sht);
+
+            new_shoff = sht_new_off as u64;
+            new_shnum = (e_shnum + 1) as u16;
+        }
+
+        // Point the ELF header at the relocated, enlarged program header table
+        // (and section header table, if one was added).
+        w64(&mut out[0x20..0x28], new_phoff as u64);
+        w16(&mut out[0x38..0x3a], new_phnum as u16);
+        w64(&mut out[0x28..0x30], new_shoff);
+        w16(&mut out[0x3c..0x3e], new_shnum);
+
         writer.write_all(&out)?;
         Ok(())
     }
