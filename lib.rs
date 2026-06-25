@@ -992,8 +992,46 @@ mod macho {
     ) -> std::io::Result<Option<&'static [u8]>> {
         #[cfg(target_arch = "x86_64")]
         {
-            // TODO: Intel Mac dylib support
-            Ok(None)
+            // Intel Mach-O embedding does not write a real named section
+            // (see `Macho::build` for x86_64): the payload is appended past
+            // __LINKEDIT and located at runtime by scanning for the
+            // `<~sui-data~>` sentinel. `getsectiondata` therefore cannot
+            // find it. Resolve the file backing the current image with
+            // `dladdr` and run the sentinel scan against that file instead.
+            use std::ffi::CStr;
+            use std::os::raw::c_char;
+            use std::path::PathBuf;
+
+            #[repr(C)]
+            #[allow(non_camel_case_types)]
+            struct Dl_info {
+                dli_fname: *const c_char,
+                dli_fbase: *mut std::ffi::c_void,
+                dli_sname: *const c_char,
+                dli_saddr: *mut std::ffi::c_void,
+            }
+
+            extern "C" {
+                fn dladdr(addr: *const std::ffi::c_void, info: *mut Dl_info) -> std::ffi::c_int;
+            }
+
+            let mut info: Dl_info = unsafe { std::mem::zeroed() };
+            let self_addr = find_section_in_current_image as *const std::ffi::c_void;
+            let ret = unsafe { dladdr(self_addr, &mut info) };
+            if ret == 0 || info.dli_fname.is_null() {
+                return Ok(None);
+            }
+
+            // SAFETY: `dladdr` succeeded with a non-null `dli_fname`, which
+            // points at a NUL-terminated path owned by dyld for the lifetime
+            // of the loaded image. We copy it out immediately.
+            let fname = unsafe { CStr::from_ptr(info.dli_fname) };
+            let Ok(fname) = fname.to_str() else {
+                return Ok(None);
+            };
+            let path = PathBuf::from(fname);
+
+            super::intel_mac::find_section_in_file(&path)
         }
 
         #[cfg(not(target_arch = "x86_64"))]
