@@ -220,6 +220,68 @@ fn test_elf_note_survives_strip() {
     assert_eq!(section, payload.as_slice());
 }
 
+// Regression for a segfault of appended binaries after `eu-strip`
+// (as run by e.g. flatpak-builder): elfutils lays the stripped output out
+// itself and zero-fills every file gap between two allocated sections. The
+// relocated program header table sits in the gap before the note, so unless an
+// allocated section covers it (`.sui.phdrs`) eu-strip clobbers it into all-zero
+// program headers and the binary segfaults on exec.
+#[cfg(all(unix, not(target_vendor = "apple"), target_arch = "x86_64"))]
+#[test]
+fn test_elf_note_survives_eu_strip() {
+    let _lock = PROCESS_LOCK.lock().unwrap();
+
+    let input = std::fs::read("tests/exec_elf64").unwrap();
+    let elf = Elf::new(&input);
+    let path = std::env::temp_dir().join("exec_elf64_eu_strip_out");
+
+    let payload = b"hello-eu-strip-note".to_vec();
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o755)
+        .open(&path)
+        .unwrap();
+    elf.append(RESOURCE_NAME, &payload, &mut out).unwrap();
+    drop(out);
+
+    let output = std::process::Command::new("eu-strip").arg(&path).output();
+    match output {
+        Ok(output) if output.status.success() => {}
+        // eu-strip not installed / refused the file: nothing to assert.
+        Ok(_) => return,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+        Err(err) => panic!("failed to run eu-strip: {}", err),
+    }
+
+    // The note still round-trips out of the stripped binary...
+    let stripped = std::fs::read(&path).unwrap();
+    let section = find_section_in_bytes(&stripped, RESOURCE_NAME).unwrap();
+    assert_eq!(section, payload.as_slice());
+
+    // ...the program header table was not zero-filled...
+    let r64 = |b: &[u8]| u64::from_le_bytes(b[..8].try_into().unwrap());
+    let r16 = |b: &[u8]| u16::from_le_bytes(b[..2].try_into().unwrap());
+    let e_phoff = r64(&stripped[0x20..0x28]) as usize;
+    let e_phentsize = r16(&stripped[0x36..0x38]) as usize;
+    let e_phnum = r16(&stripped[0x38..0x3a]) as usize;
+    assert!(e_phnum > 0, "no program headers");
+    let all_zero = (0..e_phnum).all(|i| {
+        let p = &stripped[e_phoff + i * e_phentsize..e_phoff + (i + 1) * e_phentsize];
+        p.iter().all(|&b| b == 0)
+    });
+    assert!(!all_zero, "eu-strip zero-filled the program header table");
+
+    // ...and the stripped binary still runs.
+    let status = std::process::Command::new(&path).status().unwrap();
+    assert!(
+        status.success(),
+        "stripped binary failed to run: {}",
+        status
+    );
+}
+
 #[cfg(all(unix, not(target_vendor = "apple")))]
 #[test]
 fn test_elf_note_mapped_and_preserves() {
@@ -643,16 +705,17 @@ fn test_elf_append_preserves_original_bytes() {
     let r64 = |b: &[u8]| u64::from_le_bytes(b[..8].try_into().unwrap());
     let r16 = |b: &[u8]| u16::from_le_bytes(b[..2].try_into().unwrap());
 
-    // A real allocated .note.sui section was added, so the section header
-    // table was relocated (past EOF) and grew by exactly one entry.
+    // Two allocated sections were added (.sui.phdrs covering the relocated
+    // program header table and .note.sui covering the note), so the section
+    // header table was relocated (past EOF) and grew by exactly two entries.
     assert!(
         r64(&out[0x28..0x30]) >= input.len() as u64,
         "section header table not relocated past the original image"
     );
     assert_eq!(
         r16(&out[0x3c..0x3e]),
-        r16(&input[0x3c..0x3e]) + 1,
-        "e_shnum did not grow by 1"
+        r16(&input[0x3c..0x3e]) + 2,
+        "e_shnum did not grow by 2"
     );
 
     // Program header table grew by exactly two entries (PT_LOAD + PT_NOTE).
