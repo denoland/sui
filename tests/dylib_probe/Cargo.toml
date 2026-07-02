@@ -1,0 +1,13 @@
+# Fixture crate for `test_macho_find_section_in_current_image_dylib`.
+# Built on demand by the integration test; not part of the libsui workspace.
+[package]
+name = "sui_dylib_probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+libsui = { path = "../.." }
