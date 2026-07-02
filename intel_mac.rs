@@ -77,15 +77,24 @@ fn patch_command(cmd_type: u32, buf: &mut [u8], file_len: usize) {
     }
 }
 
-/// Find section data in an Intel Mac Mach-O executable
+/// Find section data in an Intel Mac Mach-O executable.
 ///
-/// Searches for the sentinel "<~sui-data~>" from the end of the executable,
-/// reads the data length, and returns a reference to the section data.
-///
-/// # Returns
-///
-/// Returns `Some(&[u8])` if section data is found, `None` otherwise
+/// Searches the current executable for the `<~sui-data~>` sentinel and
+/// returns the embedded payload, or `None` if no payload is present.
 pub fn find_section() -> std::io::Result<Option<&'static [u8]>> {
+    let exe = std::env::current_exe()?;
+    find_section_in_file(&exe)
+}
+
+/// Find section data in an Intel Mac Mach-O image on disk.
+///
+/// Identical to [`find_section`] but reads from `path` instead of the current
+/// executable, so it can also recover the payload from a dylib loaded into
+/// the process. Used by `find_section_in_current_image` on x86_64 macOS,
+/// where the payload is appended past the Mach-O sections (rather than
+/// written as a real named section) and so cannot be read with
+/// `getsectiondata`.
+pub fn find_section_in_file(path: &std::path::Path) -> std::io::Result<Option<&'static [u8]>> {
     use std::io::{Read, Seek, SeekFrom};
 
     // Construct sentinel from reversed string to prevent it from existing as contiguous
@@ -100,8 +109,7 @@ pub fn find_section() -> std::io::Result<Option<&'static [u8]>> {
     sentinel.extend_from_slice(&magic);
     let sentinel = sentinel.as_slice();
 
-    let exe = std::env::current_exe()?;
-    let mut file = std::fs::File::open(exe)?;
+    let mut file = std::fs::File::open(path)?;
 
     // Get file size
     let file_size = file.seek(SeekFrom::End(0))?;
