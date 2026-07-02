@@ -1268,16 +1268,25 @@ impl<'a> Elf<'a> {
         }
 
         // Scan existing program headers: find the highest mapped virtual
-        // address (so the note lands above everything) and the PT_PHDR entry.
+        // address (so the note lands above everything), the PT_PHDR entry, and
+        // the first PT_LOAD's `p_vaddr - p_offset` bias.
         let mut max_vaddr_end = 0u64;
         let mut pt_phdr_index = None;
+        let mut first_load_bias: Option<i64> = None;
         for i in 0..e_phnum {
             let off = e_phoff + i * e_phentsize;
             let p = &data[off..off + PHENTSIZE64];
             match r32(&p[0..4]) {
                 PT_LOAD => {
-                    let end = r64(&p[16..24]).saturating_add(r64(&p[40..48]));
+                    let p_offset = r64(&p[8..16]);
+                    let p_vaddr = r64(&p[16..24]);
+                    let end = p_vaddr.saturating_add(r64(&p[40..48]));
                     max_vaddr_end = max_vaddr_end.max(end);
+                    // The kernel derives `AT_PHDR` from the first PT_LOAD's bias
+                    // (see below); capture it in program-header order.
+                    if first_load_bias.is_none() {
+                        first_load_bias = Some(p_vaddr as i64 - p_offset as i64);
+                    }
                 }
                 PT_PHDR => pt_phdr_index = Some(i),
                 _ => {}
@@ -1286,18 +1295,35 @@ impl<'a> Elf<'a> {
         if max_vaddr_end == 0 {
             return Err(Error::InvalidObject("No PT_LOAD segments"));
         }
+        let first_load_bias = first_load_bias.unwrap_or(0);
 
         let note = build_elf_note_payload(name, sectdata);
 
         // Layout of the appended region, all within one new PT_LOAD:
         //   [page-aligned] new program header table | note
-        // File offset and virtual address are both page-aligned, so they are
-        // congruent mod p_align and the loader maps the region correctly.
+        //
+        // The relocated program header table must stay reachable through
+        // `AT_PHDR`. Loaders that recompute it from the file's segment table
+        // (the kernel, ld.so via an explicit interpreter) cope with any
+        // placement, but a loader that trusts the classic invariant
+        //   AT_PHDR = load_bias + (first_load.p_vaddr - first_load.p_offset) + e_phoff
+        // (e.g. gVisor / Cloud Run) only finds the table when the new segment
+        // carries the *same* file-offset-to-vaddr bias as the first PT_LOAD. So
+        // pin `load_vaddr = new_phoff + first_load_bias` rather than packing the
+        // segment right above `max_vaddr_end`. `new_phoff` is bumped as needed
+        // so the resulting vaddr still clears every existing segment.
         let new_phnum = e_phnum + 2;
         let phdr_table_size = new_phnum * e_phentsize;
-        let new_phoff = align_up(data.len(), PAGE);
+        let mut new_phoff = align_up(data.len(), PAGE);
+        // Keep the note's vaddr past the last mapped page (including .bss).
+        let min_load_vaddr = align_up(max_vaddr_end as usize, PAGE) as i64;
+        if new_phoff as i64 + first_load_bias < min_load_vaddr {
+            // `min_load_vaddr` and `first_load_bias` are both page-aligned, so
+            // the adjusted `new_phoff` stays page-aligned (and past EOF).
+            new_phoff = (min_load_vaddr - first_load_bias) as usize;
+        }
         let note_file_off = align_up(new_phoff + phdr_table_size, 4);
-        let load_vaddr = align_up(max_vaddr_end as usize, PAGE) as u64;
+        let load_vaddr = (new_phoff as i64 + first_load_bias) as u64;
         let note_vaddr = load_vaddr + (note_file_off - new_phoff) as u64;
         let region_filesz = (note_file_off + note.len() - new_phoff) as u64;
 
