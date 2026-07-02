@@ -767,3 +767,54 @@ fn test_elf_append_preserves_original_bytes() {
     }
     assert!(found, "appended SUI note not found via PT_NOTE");
 }
+
+/// Regression for https://github.com/denoland/deno/issues/35700.
+///
+/// `append` relocates the program header table into a new PT_LOAD past EOF.
+/// A loader that recomputes `AT_PHDR` from the file's segment table copes with
+/// any placement, but one that trusts the classic invariant
+///   AT_PHDR = load_bias + (first_load.p_vaddr - first_load.p_offset) + e_phoff
+/// (e.g. gVisor / Cloud Run) only finds the table when the new segment shares
+/// the first PT_LOAD's file-offset-to-vaddr bias. Assert that invariant so the
+/// relocated table stays reachable through `AT_PHDR`.
+#[test]
+fn test_elf_append_phdr_reachable_via_at_phdr() {
+    let input = std::fs::read("tests/exec_elf64").unwrap();
+    let mut out = Vec::new();
+    Elf::new(&input)
+        .append(RESOURCE_NAME, &vec![0x42u8; 4096], &mut out)
+        .unwrap();
+
+    let r64 = |b: &[u8]| u64::from_le_bytes(b[..8].try_into().unwrap());
+    let r16 = |b: &[u8]| u16::from_le_bytes(b[..2].try_into().unwrap());
+    const PT_LOAD: u32 = 1;
+    const PT_PHDR: u32 = 6;
+
+    let e_phoff = r64(&out[0x20..0x28]) as i64;
+    let e_phentsize = r16(&out[0x36..0x38]) as usize;
+    let e_phnum = r16(&out[0x38..0x3a]) as usize;
+
+    let mut first_load_bias: Option<i64> = None;
+    let mut pt_phdr_vaddr: Option<i64> = None;
+    for i in 0..e_phnum {
+        let p = &out[e_phoff as usize + i * e_phentsize..];
+        let ty = u32::from_le_bytes(p[0..4].try_into().unwrap());
+        let p_offset = r64(&p[8..16]) as i64;
+        let p_vaddr = r64(&p[16..24]) as i64;
+        if ty == PT_LOAD && first_load_bias.is_none() {
+            first_load_bias = Some(p_vaddr - p_offset);
+        }
+        if ty == PT_PHDR {
+            pt_phdr_vaddr = Some(p_vaddr);
+        }
+    }
+
+    let bias = first_load_bias.expect("no PT_LOAD");
+    let pt_phdr_vaddr = pt_phdr_vaddr.expect("no PT_PHDR");
+    // The naive AT_PHDR computation must land exactly on the relocated table.
+    assert_eq!(
+        bias + e_phoff,
+        pt_phdr_vaddr,
+        "AT_PHDR = load_bias + first_load_bias + e_phoff would miss the program header table",
+    );
+}
