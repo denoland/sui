@@ -767,3 +767,80 @@ fn test_elf_append_preserves_original_bytes() {
     }
     assert!(found, "appended SUI note not found via PT_NOTE");
 }
+
+/// Regression for https://github.com/denoland/sui/issues/73.
+///
+/// `find_section_in_current_image` was unimplemented on x86_64 macOS, so an
+/// embedded section could not be read back from a dylib (e.g. `deno desktop`'s
+/// denort dylib on Intel Macs). Build a tiny cdylib that reads its own embedded
+/// section, inject a section into it, load it, and assert the payload is
+/// recovered. Runs on both Apple arches so the aarch64 `getsectiondata` path
+/// and the x86_64 sentinel-scan path are both covered.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn test_macho_find_section_in_current_image_dylib() {
+    use std::ffi::CString;
+    use std::os::raw::{c_char, c_int, c_void};
+
+    let _lock = PROCESS_LOCK.lock().unwrap();
+
+    // Build the probe cdylib (into its own target dir, so it doesn't contend
+    // with the cargo invocation running this test).
+    let status = std::process::Command::new(env!("CARGO"))
+        .args([
+            "build",
+            "--release",
+            "--manifest-path",
+            "tests/dylib_probe/Cargo.toml",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success(), "failed to build dylib probe");
+    let built = std::path::Path::new("tests/dylib_probe/target/release/libsui_dylib_probe.dylib");
+
+    // Inject a section into the freshly built dylib and re-sign it.
+    let payload = b"intel-mac-dylib-payload".to_vec();
+    let input = std::fs::read(built).unwrap();
+    let mut out = Vec::new();
+    Macho::from(input)
+        .unwrap()
+        .write_section(RESOURCE_NAME, payload.clone())
+        .unwrap()
+        .build_and_sign(&mut out)
+        .unwrap();
+    let injected = std::env::temp_dir().join("libsui_dylib_probe_injected.dylib");
+    std::fs::write(&injected, &out).unwrap();
+
+    // Load the injected dylib and ask it to read its own embedded section.
+    extern "C" {
+        fn dlopen(path: *const c_char, mode: c_int) -> *mut c_void;
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+        fn dlclose(handle: *mut c_void) -> c_int;
+    }
+    const RTLD_NOW: c_int = 2;
+
+    type Probe = unsafe extern "C" fn(*const c_char, *mut *const u8, *mut usize) -> bool;
+
+    let path_c = CString::new(injected.to_str().unwrap()).unwrap();
+    let handle = unsafe { dlopen(path_c.as_ptr(), RTLD_NOW) };
+    assert!(!handle.is_null(), "dlopen failed for injected dylib");
+
+    let sym = CString::new("sui_probe_section").unwrap();
+    let probe_ptr = unsafe { dlsym(handle, sym.as_ptr()) };
+    assert!(!probe_ptr.is_null(), "sui_probe_section not found");
+    let probe: Probe = unsafe { std::mem::transmute(probe_ptr) };
+
+    let name = CString::new(RESOURCE_NAME).unwrap();
+    let mut data_ptr: *const u8 = std::ptr::null();
+    let mut data_len: usize = 0;
+    let found = unsafe { probe(name.as_ptr(), &mut data_ptr, &mut data_len) };
+    assert!(
+        found,
+        "find_section_in_current_image returned None in dylib"
+    );
+
+    let recovered = unsafe { std::slice::from_raw_parts(data_ptr, data_len) };
+    assert_eq!(recovered, payload.as_slice(), "recovered payload mismatch");
+
+    unsafe { dlclose(handle) };
+}
