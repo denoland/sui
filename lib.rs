@@ -1331,6 +1331,7 @@ impl<'a> Elf<'a> {
         // binary has no section table to extend, and keeps the note via
         // PT_NOTE alone.
         const SHENTSIZE64: usize = 64;
+        const SHT_PROGBITS: u32 = 1;
         const SHT_NOTE: u32 = 7;
         const SHF_ALLOC: u64 = 2;
         const SHN_XINDEX: usize = 0xffff;
@@ -1364,10 +1365,12 @@ impl<'a> Elf<'a> {
         });
 
         if let Some((shstr_off, shstr_size)) = shstr_range {
-            // Relocate and grow .shstrtab so it carries the new section name.
+            // Relocate and grow .shstrtab so it carries the new section names.
             let mut new_shstr = data[shstr_off..shstr_off + shstr_size].to_vec();
-            let name_index = new_shstr.len() as u32;
+            let note_name_index = new_shstr.len() as u32;
             new_shstr.extend_from_slice(b".note.sui\0");
+            let phdr_name_index = new_shstr.len() as u32;
+            new_shstr.extend_from_slice(b".sui.phdrs\0");
 
             // .shstrtab and the section header table are non-allocated
             // metadata: place them past the note, outside the new PT_LOAD.
@@ -1377,15 +1380,41 @@ impl<'a> Elf<'a> {
             out.resize(sht_new_off, 0);
 
             // Copy the original section headers, repoint the relocated
-            // .shstrtab entry, then append the .note.sui section header.
+            // .shstrtab entry, then append the new section headers.
             let mut sht = data[e_shoff..e_shoff + e_shnum * e_shentsize].to_vec();
             {
                 let e = &mut sht[e_shstrndx * e_shentsize..e_shstrndx * e_shentsize + SHENTSIZE64];
                 w64(&mut e[24..32], shstr_new_off as u64);
                 w64(&mut e[32..40], new_shstr.len() as u64);
             }
+
+            // The relocated program header table lives past the original EOF,
+            // in the file gap before the note. Cover it with an allocated
+            // section so section-based strip tools that keep the file's byte
+            // layout preserve it. `eu-strip` in particular lays the output out
+            // with ELF_F_LAYOUT and zero-fills every file gap that lies between
+            // two allocated sections; without a section spanning the program
+            // header table it treats those bytes as dead space and clobbers
+            // them, leaving a binary with all-zero program headers that
+            // segfaults on exec. This must be a plain PROGBITS section, not part
+            // of the note: BFD `strip` parses SHT_NOTE contents, so folding the
+            // (non-note) program header bytes into `.note.sui` corrupts the note
+            // on strip and loses it.
+            let mut phdr_sh = vec![0u8; e_shentsize];
+            w32(&mut phdr_sh[0..4], phdr_name_index); // sh_name
+            w32(&mut phdr_sh[4..8], SHT_PROGBITS); // sh_type
+            w64(&mut phdr_sh[8..16], SHF_ALLOC); // sh_flags
+            w64(&mut phdr_sh[16..24], load_vaddr); // sh_addr
+            w64(&mut phdr_sh[24..32], new_phoff as u64); // sh_offset
+            w64(&mut phdr_sh[32..40], (note_file_off - new_phoff) as u64); // sh_size
+            w64(&mut phdr_sh[48..56], PAGE as u64); // sh_addralign
+            sht.extend_from_slice(&phdr_sh);
+
+            // The allocated SHT_NOTE section keeps the note reachable through the
+            // section table (what BFD-based tools rebuild from); the runtime
+            // reads it through its PT_NOTE program header regardless.
             let mut note_sh = vec![0u8; e_shentsize];
-            w32(&mut note_sh[0..4], name_index); // sh_name
+            w32(&mut note_sh[0..4], note_name_index); // sh_name
             w32(&mut note_sh[4..8], SHT_NOTE); // sh_type
             w64(&mut note_sh[8..16], SHF_ALLOC); // sh_flags
             w64(&mut note_sh[16..24], note_vaddr); // sh_addr
@@ -1396,7 +1425,7 @@ impl<'a> Elf<'a> {
             out.extend_from_slice(&sht);
 
             new_shoff = sht_new_off as u64;
-            new_shnum = (e_shnum + 1) as u16;
+            new_shnum = (e_shnum + 2) as u16;
         }
 
         // Point the ELF header at the relocated, enlarged program header table
