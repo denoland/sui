@@ -1,6 +1,6 @@
 [package]
 name = "libsui"
-version = "0.16.3"
+version = "0.16.4"
 authors = ["the Deno authors"]
 edition = "2021"
 license = "MIT"
