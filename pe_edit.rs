@@ -1075,13 +1075,15 @@ impl<'a> Image<'a> {
                         resource_section_data =
                             resource_directory.build(old_resource_data_directory.virtual_address);
                         resource_dd.size = new_resource_directory_size;
-                        // adjust section size and virtual size header values
-                        old_resource_section.size_of_raw_data +=
-                            new_resource_directory_size - old_resource_section.size_of_raw_data;
-                        old_resource_section.virtual_size += aligned_to(
-                            new_resource_directory_size - old_resource_section.size_of_raw_data,
-                            windows_header.section_alignment(),
-                        );
+                        // libsui: assign the grown section/virtual sizes directly.
+                        // Upstream used `size_of_raw_data += new - size_of_raw_data`
+                        // then `virtual_size += aligned_to(new - size_of_raw_data, ..)`,
+                        // but the second read saw the already-mutated size_of_raw_data
+                        // (== new), so the delta was 0 and virtual_size never grew,
+                        // leaving SizeOfImage under-covering an extended-in-place
+                        // section. Matches the truncate and append-new-section paths.
+                        old_resource_section.size_of_raw_data = new_resource_directory_size;
+                        old_resource_section.virtual_size = new_resource_directory_size_aligned;
                     }
                 } else {
                     add_new_section = true;
