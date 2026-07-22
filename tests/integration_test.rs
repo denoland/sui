@@ -818,3 +818,154 @@ fn test_elf_append_phdr_reachable_via_at_phdr() {
         "AT_PHDR = load_bias + first_load_bias + e_phoff would miss the program header table",
     );
 }
+
+// --- SizeOfImage regression tests for the PE resource writer ---------------
+//
+// Embedding a resource rebuilds the PE and appends a new section holding the
+// resource directory. The image's SizeOfImage must grow to cover that section's
+// full, alignment-rounded virtual extent. The previous implementation added the
+// *unaligned raw* length of the resource data instead, under-counting SizeOfImage
+// by up to one SectionAlignment page. On Windows that leaves the tail of the
+// resource section unmapped, which surfaces either as an access violation at load
+// (denoland/deno#36238) or as the runtime failing to find the embedded section
+// (denoland/deno#36206, "Could not find standalone binary section", seen with
+// `deno compile --icon`).
+//
+// These tests build the PE in memory and inspect the resulting headers, so they
+// run on every platform, not just Windows.
+
+fn pe_read_u16(data: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes([data[off], data[off + 1]])
+}
+
+fn pe_read_u32(data: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+}
+
+struct PeFacts {
+    size_of_image: u32,
+    section_alignment: u32,
+    // Highest VirtualAddress + VirtualSize across all sections (VirtualSize is
+    // already alignment-rounded in the section header).
+    max_section_end: u32,
+    // Resource table data directory (RVA, size); size is the unaligned length.
+    resource_rva: u32,
+    resource_size: u32,
+}
+
+fn parse_pe(data: &[u8]) -> PeFacts {
+    let e_lfanew = pe_read_u32(data, 0x3c) as usize;
+    assert_eq!(&data[e_lfanew..e_lfanew + 4], b"PE\0\0", "PE signature");
+    let coff = e_lfanew + 4;
+    let number_of_sections = pe_read_u16(data, coff + 2) as usize;
+    let size_of_optional_header = pe_read_u16(data, coff + 16) as usize;
+    let opt = coff + 20;
+    let magic = pe_read_u16(data, opt);
+    // SizeOfImage (opt+56) and SectionAlignment (opt+32) sit at the same
+    // optional-header offsets for both PE32 (0x10b) and PE32+ (0x20b).
+    assert!(
+        magic == 0x10b || magic == 0x20b,
+        "unexpected optional header magic {magic:#x}"
+    );
+    let section_alignment = pe_read_u32(data, opt + 32);
+    let size_of_image = pe_read_u32(data, opt + 56);
+    // The data directory array starts at a magic-dependent offset; the resource
+    // table is entry index 2 (8 bytes each: RVA then size).
+    let data_dir = if magic == 0x10b { opt + 96 } else { opt + 112 };
+    let resource_rva = pe_read_u32(data, data_dir + 2 * 8);
+    let resource_size = pe_read_u32(data, data_dir + 2 * 8 + 4);
+
+    let sections = opt + size_of_optional_header;
+    let mut max_section_end = 0u32;
+    for i in 0..number_of_sections {
+        let sh = sections + i * 40;
+        let virtual_size = pe_read_u32(data, sh + 8);
+        let virtual_address = pe_read_u32(data, sh + 12);
+        max_section_end = max_section_end.max(virtual_address + virtual_size);
+    }
+
+    PeFacts {
+        size_of_image,
+        section_alignment,
+        max_section_end,
+        resource_rva,
+        resource_size,
+    }
+}
+
+fn assert_valid_size_of_image(out: &[u8]) {
+    let f = parse_pe(out);
+    assert!(f.resource_size > 0, "resource data directory should be populated");
+    // Per the PE spec SizeOfImage must be a multiple of SectionAlignment. The old
+    // `size_of_image += <unaligned raw length>` produced a non-aligned value for
+    // any resource whose serialized size was not a whole number of pages.
+    assert_eq!(
+        f.size_of_image % f.section_alignment,
+        0,
+        "SizeOfImage {:#x} is not a multiple of SectionAlignment {:#x}",
+        f.size_of_image,
+        f.section_alignment,
+    );
+    // SizeOfImage must cover the virtual extent of every section, including the
+    // appended resource section.
+    assert!(
+        f.size_of_image >= f.max_section_end,
+        "SizeOfImage {:#x} does not cover highest section end {:#x}",
+        f.size_of_image,
+        f.max_section_end,
+    );
+    // The embedded resource must lie fully within the mapped image.
+    assert!(
+        f.resource_rva + f.resource_size <= f.size_of_image,
+        "resource [{:#x}, {:#x}) exceeds SizeOfImage {:#x}",
+        f.resource_rva,
+        f.resource_rva + f.resource_size,
+        f.size_of_image,
+    );
+}
+
+fn build_pe_with_resource(payload_size: usize) -> Vec<u8> {
+    let input = std::fs::read("tests/exec_pe64").unwrap();
+    let pe = PortableExecutable::from(&input).unwrap();
+    let mut out: Vec<u8> = Vec::new();
+    pe.write_resource(RESOURCE_NAME, vec![0u8; payload_size])
+        .unwrap()
+        .build(&mut out)
+        .unwrap();
+    out
+}
+
+#[test]
+fn pe_size_of_image_small_resource() {
+    assert_valid_size_of_image(&build_pe_with_resource(64));
+}
+
+#[test]
+fn pe_size_of_image_unaligned_resource() {
+    // A size deliberately not a whole number of pages: this is exactly where
+    // adding the unaligned raw length under-counted SizeOfImage.
+    assert_valid_size_of_image(&build_pe_with_resource(4096 * 3 + 123));
+}
+
+#[test]
+fn pe_size_of_image_large_resource() {
+    // 5 MiB spans many pages; the old under-count left the tail unmapped.
+    assert_valid_size_of_image(&build_pe_with_resource(5 * 1024 * 1024));
+}
+
+#[test]
+fn pe_size_of_image_with_icon() {
+    // Mirrors `deno compile --icon`, the reported failing path (#36206): set_icon
+    // rewrites the resource tree with icon bitmaps alongside the payload.
+    let input = std::fs::read("tests/exec_pe64").unwrap();
+    let icon = std::fs::read("tests/test.ico").unwrap();
+    let pe = PortableExecutable::from(&input).unwrap();
+    let mut out: Vec<u8> = Vec::new();
+    pe.set_icon(&icon)
+        .unwrap()
+        .write_resource(RESOURCE_NAME, vec![0u8; 64 * 1024])
+        .unwrap()
+        .build(&mut out)
+        .unwrap();
+    assert_valid_size_of_image(&out);
+}

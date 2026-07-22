@@ -69,10 +69,9 @@
 //! unpacker stub at startup. See the project README for per-format details.
 
 use core::mem::size_of;
-use editpe::{
-    constants::{CODE_PAGE_ID_EN_US, RT_GROUP_ICON, RT_ICON, RT_RCDATA},
-    types::{IconDirectory, IconDirectoryEntry},
-    ResourceData, ResourceEntry, ResourceEntryName, ResourceTable,
+use pe_edit::{
+    IconDirectory, IconDirectoryEntry, ResourceData, ResourceEntry, ResourceEntryName,
+    ResourceTable, CODE_PAGE_ID_EN_US, RT_GROUP_ICON, RT_ICON, RT_RCDATA,
 };
 use image::{imageops::FilterType::Lanczos3, ImageFormat, ImageReader};
 use std::io::Cursor;
@@ -81,6 +80,10 @@ use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 pub mod apple_codesign;
 pub mod intel_mac;
+
+// libsui's own minimal PE resource writer, reduced from the BSD-2-Clause
+// `editpe` crate. See pe_edit.rs and LICENSE-editpe.
+mod pe_edit;
 
 #[cfg(all(unix, not(target_vendor = "apple")))]
 pub use elf::find_section;
@@ -133,8 +136,8 @@ impl std::error::Error for Error {}
 /// Build a new PE from existing PE and write auxillary data as
 /// a resource in the .rsrc section.
 pub struct PortableExecutable<'a> {
-    image: editpe::Image<'a>,
-    resource_dir: editpe::ResourceDirectory,
+    image: pe_edit::Image<'a>,
+    resource_dir: pe_edit::ResourceDirectory,
     icons: Vec<IconDirectoryEntry>,
 }
 
@@ -142,9 +145,9 @@ impl<'a> PortableExecutable<'a> {
     /// Parse from a PE file
     pub fn from(data: &'a [u8]) -> Result<Self, Error> {
         Ok(Self {
-            image: editpe::Image::parse(data)
+            image: pe_edit::Image::parse(data)
                 .map_err(|_| Error::InvalidObject("Failed to parse PE"))?,
-            resource_dir: editpe::ResourceDirectory::default(),
+            resource_dir: pe_edit::ResourceDirectory::default(),
             icons: Vec::new(),
         })
     }
@@ -169,12 +172,12 @@ impl<'a> PortableExecutable<'a> {
         };
         let name = name.to_uppercase();
         rc_table.insert(
-            editpe::ResourceEntryName::from_string(name.clone()),
+            pe_edit::ResourceEntryName::from_string(name.clone()),
             ResourceEntry::Table(ResourceTable::default()),
         );
 
         let rc_table = match rc_table
-            .get_mut(editpe::ResourceEntryName::from_string(name))
+            .get_mut(pe_edit::ResourceEntryName::from_string(name))
             .unwrap()
         {
             ResourceEntry::Table(table) => table,
@@ -182,7 +185,7 @@ impl<'a> PortableExecutable<'a> {
                 return Err(Error::InvalidObject("Resource entry is not a table"));
             }
         };
-        let mut entry = editpe::ResourceData::default();
+        let mut entry = pe_edit::ResourceData::default();
         entry.set_data(sectdata);
 
         rc_table.insert(ResourceEntryName::ID(0), ResourceEntry::Data(entry));

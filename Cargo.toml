@@ -10,7 +10,11 @@ repository = "https://github.com/denoland/sui"
 [dependencies]
 image = { version = "0.25", default-features = false, features = ["bmp", "ico", "png"] }
 libc = "0.2"
-editpe = { version = "0.1.0", default-features = false }
+# The PE resource writer was reduced from the unmaintained editpe crate into
+# pe_edit.rs (see pe_edit.rs and LICENSE-editpe). Its resource writer miscomputed
+# SizeOfImage; we own it now.
+indexmap = "2.1"
+thiserror = "1.0"
 zerocopy = { version = "0.7", features = ["derive"] }
 sha2 = "0.10"
 object = { version = "=0.36.3", default-features = false, features = ["build", "read_core", "elf", "std"] }
