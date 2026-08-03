@@ -538,53 +538,6 @@ impl Macho {
         let header = Header64::read_from_prefix(&obj)
             .ok_or(Error::InvalidObject("Failed to read header"))?;
 
-        // Atomically strip code signature first for intel binaries.
-        #[cfg(target_vendor = "apple")]
-        let obj = if header.cputype != CPU_TYPE_ARM_64 {
-            use std::io::Write;
-
-            let tmp_dir = std::env::temp_dir();
-            std::fs::create_dir_all(&tmp_dir)?;
-            let tmp_path = tmp_dir.join(format!("sui_tmp_{}", std::process::id()));
-
-            let mut tmp_file = std::fs::File::create(&tmp_path)?;
-            tmp_file.write_all(&obj)?;
-            drop(tmp_file);
-
-            match std::process::Command::new("codesign")
-                .arg("--remove-signature")
-                .arg(&tmp_path)
-                .output()
-            {
-                Ok(output) => {
-                    if !output.status.success() {
-                        // If codesign fails, just use the original binary
-                        eprintln!(
-                            "Warning: Failed to remove code signature: {}",
-                            String::from_utf8_lossy(&output.stderr)
-                        );
-                        std::fs::remove_file(&tmp_path).ok();
-                        obj
-                    } else {
-                        // Read the stripped binary
-                        let stripped = std::fs::read(&tmp_path)?;
-                        std::fs::remove_file(&tmp_path).ok();
-                        stripped
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // codesign not found, skip it
-                    std::fs::remove_file(&tmp_path).ok();
-                    obj
-                }
-                Err(e) => {
-                    std::fs::remove_file(&tmp_path).ok();
-                    return Err(e.into());
-                }
-            }
-        } else {
-            obj
-        };
 
         let mut commands: Vec<(u32, u32, usize)> = Vec::with_capacity(header.ncmds as usize);
 
@@ -645,13 +598,7 @@ impl Macho {
             ));
         }
 
-        /* x86_64 */
-        if self.header.cputype != CPU_TYPE_ARM_64 {
-            self.sectdata = Some(sectdata);
-            return Ok(self);
-        }
-
-        /* arm64 */
+        /* arm64 and x86_64 */
         let page_size = 0x10000;
 
         self.seg = SegmentCommand64 {
@@ -813,29 +760,6 @@ impl Macho {
 
     /// Build and write the modified Mach-O file
     pub fn build<W: Write>(mut self, writer: &mut W) -> Result<(), Error> {
-        if self.header.cputype != CPU_TYPE_ARM_64 {
-            let mut data = self.data;
-
-            if let Some(sectdata) = self.sectdata {
-                // Construct sentinel from reversed string to prevent it from existing as contiguous
-                // bytes in the binary. Use black_box to prevent compiler from const-evaluating.
-                let mut sentinel = Vec::with_capacity(16);
-                let reversed = std::hint::black_box(b">~atad-ius~<"); // "<~sui-data~>" reversed
-                for &byte in reversed.iter().rev() {
-                    sentinel.push(byte);
-                }
-                // Add magic bytes in reverse order with black_box
-                let magic = std::hint::black_box([0xEF, 0xBE, 0xAD, 0xDE]);
-                sentinel.extend_from_slice(&magic);
-                data.extend_from_slice(&sentinel);
-                data.extend_from_slice(&(sectdata.len() as u64).to_le_bytes());
-                data.extend_from_slice(&sectdata);
-            }
-
-            intel_mac::patch_macho_executable(&mut data);
-            writer.write_all(&data)?;
-            return Ok(());
-        };
 
         writer.write_all(self.header.as_bytes())?;
 
@@ -937,12 +861,6 @@ impl Macho {
 #[cfg(target_vendor = "apple")]
 mod macho {
     pub fn find_section(_section_name: &str) -> std::io::Result<Option<&[u8]>> {
-        #[cfg(target_arch = "x86_64")]
-        {
-            super::intel_mac::find_section()
-        }
-
-        #[cfg(not(target_arch = "x86_64"))]
         {
             use super::SEGNAME;
             use std::ffi::CString;
@@ -993,52 +911,8 @@ mod macho {
     pub fn find_section_in_current_image(
         _section_name: &str,
     ) -> std::io::Result<Option<&'static [u8]>> {
-        #[cfg(target_arch = "x86_64")]
         {
-            // Intel Mach-O embedding does not write a real named section
-            // (see `Macho::build` for x86_64): the payload is appended past
-            // __LINKEDIT and located at runtime by scanning for the
-            // `<~sui-data~>` sentinel. `getsectiondata` therefore cannot
-            // find it. Resolve the file backing the current image with
-            // `dladdr` and run the sentinel scan against that file instead.
-            use std::ffi::CStr;
-            use std::os::raw::c_char;
-            use std::path::PathBuf;
 
-            #[repr(C)]
-            #[allow(non_camel_case_types)]
-            struct Dl_info {
-                dli_fname: *const c_char,
-                dli_fbase: *mut std::ffi::c_void,
-                dli_sname: *const c_char,
-                dli_saddr: *mut std::ffi::c_void,
-            }
-
-            extern "C" {
-                fn dladdr(addr: *const std::ffi::c_void, info: *mut Dl_info) -> std::ffi::c_int;
-            }
-
-            let mut info: Dl_info = unsafe { std::mem::zeroed() };
-            let self_addr = find_section_in_current_image as *const std::ffi::c_void;
-            let ret = unsafe { dladdr(self_addr, &mut info) };
-            if ret == 0 || info.dli_fname.is_null() {
-                return Ok(None);
-            }
-
-            // SAFETY: `dladdr` succeeded with a non-null `dli_fname`, which
-            // points at a NUL-terminated path owned by dyld for the lifetime
-            // of the loaded image. We copy it out immediately.
-            let fname = unsafe { CStr::from_ptr(info.dli_fname) };
-            let Ok(fname) = fname.to_str() else {
-                return Ok(None);
-            };
-            let path = PathBuf::from(fname);
-
-            super::intel_mac::find_section_in_file(&path)
-        }
-
-        #[cfg(not(target_arch = "x86_64"))]
-        {
             use super::SEGNAME;
             use std::ffi::CString;
             use std::os::raw::c_char;
