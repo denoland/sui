@@ -949,7 +949,7 @@ fn resource_entry(data: &[u8], resource_base: usize, directory_offset: usize, id
     panic!("resource entry {id} not found");
 }
 
-fn pe_version_resource(data: &[u8]) -> &[u8] {
+fn pe_resource_base(data: &[u8]) -> (usize, u32) {
     let e_lfanew = pe_read_u32(data, 0x3c) as usize;
     let coff = e_lfanew + 4;
     let section_count = pe_read_u16(data, coff + 2) as usize;
@@ -974,6 +974,12 @@ fn pe_version_resource(data: &[u8]) -> &[u8] {
                 .then_some(raw_offset + (resource_rva - virtual_address) as usize)
         })
         .expect("resource directory does not map to a section");
+
+    (resource_base, resource_rva)
+}
+
+fn pe_version_resource(data: &[u8]) -> &[u8] {
+    let (resource_base, resource_rva) = pe_resource_base(data);
 
     let version_type = resource_entry(data, resource_base, 0, 16);
     let version_name = resource_entry(
@@ -1000,6 +1006,15 @@ fn pe_version_resource(data: &[u8]) -> &[u8] {
     assert_eq!(pe_read_u32(data, data_entry + 8), 1200, "version code page");
     let data_offset = resource_base + (data_rva - resource_rva) as usize;
     &data[data_offset..data_offset + data_size]
+}
+
+fn resource_directory_ids(data: &[u8], resource_base: usize, directory_offset: usize) -> Vec<u32> {
+    let directory = resource_base + directory_offset;
+    let entry_count = usize::from(pe_read_u16(data, directory + 12))
+        + usize::from(pe_read_u16(data, directory + 14));
+    (0..entry_count)
+        .map(|entry_index| pe_read_u32(data, directory + 16 + entry_index * 8))
+        .collect()
 }
 
 #[test]
@@ -1034,6 +1049,30 @@ fn pe_writes_version_resource() {
             .windows(version_string.len())
             .any(|bytes| bytes == version_string),
         "custom version string missing from RT_VERSION resource",
+    );
+}
+
+#[test]
+fn pe_sorts_resource_types_when_writing_icon_and_version() {
+    let input = std::fs::read("tests/exec_pe64").unwrap();
+    let icon = std::fs::read("tests/test.ico").unwrap();
+    let mut out = Vec::new();
+    PortableExecutable::from(&input)
+        .unwrap()
+        .set_icon(&icon)
+        .unwrap()
+        .set_version([1, 2, 3, 0], None)
+        .unwrap()
+        .write_resource(RESOURCE_NAME, vec![0; 16])
+        .unwrap()
+        .build(&mut out)
+        .unwrap();
+
+    let (resource_base, _) = pe_resource_base(&out);
+    assert_eq!(
+        resource_directory_ids(&out, resource_base, 0),
+        vec![3, 10, 14, 16],
+        "resource type entries must be sorted for Windows resource lookup",
     );
 }
 
