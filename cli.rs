@@ -40,6 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if utils::is_pe(&exe) {
         PortableExecutable::from(&exe)?
             .set_icon(TEST_ICO)?
+            .set_version([1u16, 2, 3, 0], Some("1.2.3.0-preview"))?
             .write_resource(sectionname, data)?
             .build(&mut out)?;
     } else if utils::is_macho(&exe) {

@@ -71,15 +71,17 @@
 use core::mem::size_of;
 use pe_edit::{
     IconDirectory, IconDirectoryEntry, ResourceData, ResourceEntry, ResourceEntryName,
-    ResourceTable, CODE_PAGE_ID_EN_US, RT_GROUP_ICON, RT_ICON, RT_RCDATA,
+    ResourceTable, CODE_PAGE_ID_EN_US, RT_GROUP_ICON, RT_ICON, RT_RCDATA, RT_VERSION,
 };
 use image::{imageops::FilterType::Lanczos3, ImageFormat, ImageReader};
+use std::borrow::Borrow;
 use std::io::Cursor;
 use std::io::Write;
 use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 pub mod apple_codesign;
 pub mod intel_mac;
+mod version;
 
 // libsui's own minimal PE resource writer, reduced from the BSD-2-Clause
 // `editpe` crate. See pe_edit.rs and LICENSE-editpe.
@@ -253,6 +255,48 @@ impl<'a> PortableExecutable<'a> {
             icon_table.insert(ResourceEntryName::ID(id), ResourceEntry::Table(inner_table));
         }
         self.icons = icon_directory_entries;
+
+        Ok(self)
+    }
+
+    /// Set the version of the executable.
+    ///
+    /// `version` is `[major, minor, patch, build]`, e.g. `[1, 2, 3, 0]`.
+    /// `version_str` is the human-readable string stored in `StringFileInfo`.
+    /// If `None`, it is derived from `version` as `"major.minor.patch.build"`.
+    pub fn set_version<T: Borrow<[u16; 4]>>(
+        mut self,
+        version: T,
+        version_str: Option<&str>,
+    ) -> Result<Self, Error> {
+        let root = self.resource_dir.root_mut();
+        if root.get(ResourceEntryName::ID(RT_VERSION as u32)).is_none() {
+            root.insert(
+                ResourceEntryName::ID(RT_VERSION as u32),
+                ResourceEntry::Table(ResourceTable::default()),
+            );
+        }
+        let ver_table = match root
+            .get_mut(ResourceEntryName::ID(RT_VERSION as u32))
+            .unwrap()
+        {
+            ResourceEntry::Table(table) => table,
+            ResourceEntry::Data(_) => {
+                return Err(Error::InvalidObject("RT_VERSION is not a table"))
+            }
+        };
+
+        let mut entry = ResourceData::default();
+        let version_info = version::build_version_info(version.borrow(), version_str);
+        entry.set_codepage(CODE_PAGE_ID_EN_US as u32);
+        entry.set_data(version_info);
+
+        let mut inner_table = ResourceTable::default();
+        inner_table.insert(
+            ResourceEntryName::ID(version::VERSION_LANGUAGE_EN_US as u32),
+            ResourceEntry::Data(entry),
+        );
+        ver_table.insert(ResourceEntryName::ID(1), ResourceEntry::Table(inner_table));
 
         Ok(self)
     }
@@ -1703,6 +1747,15 @@ pub mod utils {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_version_accepts_array() {
+        let input = std::fs::read("tests/exec_pe64").unwrap();
+        let pe = PortableExecutable::from(&input).unwrap();
+        let version = [1, 2, 3, 0];
+
+        assert!(pe.set_version(version, None).is_ok());
+    }
 
     // Build a minimal arm64 Mach-O containing __TEXT, __LINKEDIT, and the
     // dyld-1284.13 commands LC_FUNCTION_VARIANTS / LC_FUNCTION_VARIANT_FIXUPS,
