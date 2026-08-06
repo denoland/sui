@@ -935,6 +935,147 @@ fn build_pe_with_resource(payload_size: usize) -> Vec<u8> {
     out
 }
 
+fn resource_entry(data: &[u8], resource_base: usize, directory_offset: usize, id: u32) -> u32 {
+    let directory = resource_base + directory_offset;
+    let entry_count = usize::from(pe_read_u16(data, directory + 12))
+        + usize::from(pe_read_u16(data, directory + 14));
+    for entry_index in 0..entry_count {
+        let entry = directory + 16 + entry_index * 8;
+        let name = pe_read_u32(data, entry);
+        if name & 0x8000_0000 == 0 && name == id {
+            return pe_read_u32(data, entry + 4);
+        }
+    }
+    panic!("resource entry {id} not found");
+}
+
+fn pe_resource_base(data: &[u8]) -> (usize, u32) {
+    let e_lfanew = pe_read_u32(data, 0x3c) as usize;
+    let coff = e_lfanew + 4;
+    let section_count = pe_read_u16(data, coff + 2) as usize;
+    let optional_header_size = pe_read_u16(data, coff + 16) as usize;
+    let optional_header = coff + 20;
+    let magic = pe_read_u16(data, optional_header);
+    let data_directory = if magic == 0x10b {
+        optional_header + 96
+    } else {
+        assert_eq!(magic, 0x20b, "unexpected optional header magic");
+        optional_header + 112
+    };
+    let resource_rva = pe_read_u32(data, data_directory + 16);
+    let sections = optional_header + optional_header_size;
+    let resource_base = (0..section_count)
+        .find_map(|index| {
+            let section = sections + index * 40;
+            let virtual_address = pe_read_u32(data, section + 12);
+            let raw_size = pe_read_u32(data, section + 16);
+            let raw_offset = pe_read_u32(data, section + 20) as usize;
+            (resource_rva >= virtual_address && resource_rva < virtual_address + raw_size)
+                .then_some(raw_offset + (resource_rva - virtual_address) as usize)
+        })
+        .expect("resource directory does not map to a section");
+
+    (resource_base, resource_rva)
+}
+
+fn pe_version_resource(data: &[u8]) -> &[u8] {
+    let (resource_base, resource_rva) = pe_resource_base(data);
+
+    let version_type = resource_entry(data, resource_base, 0, 16);
+    let version_name = resource_entry(
+        data,
+        resource_base,
+        (version_type & !0x8000_0000) as usize,
+        1,
+    );
+    let version_language = resource_entry(
+        data,
+        resource_base,
+        (version_name & !0x8000_0000) as usize,
+        0x0409, // English (United States),
+    );
+    assert_eq!(
+        version_language & 0x8000_0000,
+        0,
+        "version leaf must be data"
+    );
+
+    let data_entry = resource_base + version_language as usize;
+    let data_rva = pe_read_u32(data, data_entry);
+    let data_size = pe_read_u32(data, data_entry + 4) as usize;
+    assert_eq!(pe_read_u32(data, data_entry + 8), 1200, "version code page");
+    let data_offset = resource_base + (data_rva - resource_rva) as usize;
+    &data[data_offset..data_offset + data_size]
+}
+
+fn resource_directory_ids(data: &[u8], resource_base: usize, directory_offset: usize) -> Vec<u32> {
+    let directory = resource_base + directory_offset;
+    let entry_count = usize::from(pe_read_u16(data, directory + 12))
+        + usize::from(pe_read_u16(data, directory + 14));
+    (0..entry_count)
+        .map(|entry_index| pe_read_u32(data, directory + 16 + entry_index * 8))
+        .collect()
+}
+
+#[test]
+fn pe_writes_version_resource() {
+    let input = std::fs::read("tests/exec_pe64").unwrap();
+    let mut out = Vec::new();
+    PortableExecutable::from(&input)
+        .unwrap()
+        .set_version([10, 20, 30, 40], Some("10.20.30-preview"))
+        .unwrap()
+        .build(&mut out)
+        .unwrap();
+
+    let version = pe_version_resource(&out);
+    assert_eq!(u16::from_le_bytes(version[2..4].try_into().unwrap()), 52);
+    assert_eq!(
+        u32::from_le_bytes(version[48..52].try_into().unwrap()),
+        0x000a_0014
+    );
+    assert_eq!(
+        u32::from_le_bytes(version[52..56].try_into().unwrap()),
+        0x001e_0028
+    );
+
+    let version_string: Vec<u8> = "10.20.30-preview"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    assert!(
+        version
+            .windows(version_string.len())
+            .any(|bytes| bytes == version_string),
+        "custom version string missing from RT_VERSION resource",
+    );
+}
+
+#[test]
+fn pe_sorts_resource_types_when_writing_icon_and_version() {
+    let input = std::fs::read("tests/exec_pe64").unwrap();
+    let icon = std::fs::read("tests/test.ico").unwrap();
+    let mut out = Vec::new();
+    PortableExecutable::from(&input)
+        .unwrap()
+        .set_icon(&icon)
+        .unwrap()
+        .set_version([1, 2, 3, 0], None)
+        .unwrap()
+        .write_resource(RESOURCE_NAME, vec![0; 16])
+        .unwrap()
+        .build(&mut out)
+        .unwrap();
+
+    let (resource_base, _) = pe_resource_base(&out);
+    assert_eq!(
+        resource_directory_ids(&out, resource_base, 0),
+        vec![3, 10, 14, 16],
+        "resource type entries must be sorted for Windows resource lookup",
+    );
+}
+
 #[test]
 fn pe_size_of_image_small_resource() {
     assert_valid_size_of_image(&build_pe_with_resource(64));

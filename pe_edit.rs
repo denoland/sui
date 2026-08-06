@@ -97,6 +97,7 @@ pub const PE_64_MAGIC: WORD = 0x020b;
 pub const RT_ICON: WORD = 0x03;
 pub const RT_RCDATA: WORD = 0x0A;
 pub const RT_GROUP_ICON: WORD = 0x0E;
+pub const RT_VERSION: WORD = 0x10;
 
 // https://docs.microsoft.com/en-us/windows/win32/debug/pe-format#section-flags
 pub const IMAGE_SCN_CNT_INITIALIZED_DATA: DWORD = 0x00000040;
@@ -415,6 +416,30 @@ pub struct ResourceTable {
     pub(crate) entries: IndexMap<ResourceEntryName, ResourceEntry>,
 }
 impl ResourceTable {
+    fn sorted_entries(&self) -> Vec<(&ResourceEntryName, &ResourceEntry)> {
+        let mut entries: Vec<_> = self.entries.iter().collect();
+        // PE spec: named entries precede IDs; both groups sort ascending.
+        // https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#resource-directory-entries
+        entries.sort_by(
+            |(left_name, _), (right_name, _)| match (left_name, right_name) {
+                (ResourceEntryName::Name(left), ResourceEntryName::Name(right)) => left[2..]
+                    .chunks_exact(2)
+                    .map(|code_unit| u16::from_le_bytes(code_unit.try_into().unwrap()))
+                    .cmp(
+                        right[2..]
+                            .chunks_exact(2)
+                            .map(|code_unit| u16::from_le_bytes(code_unit.try_into().unwrap())),
+                    ),
+                (ResourceEntryName::Name(_), ResourceEntryName::ID(_)) => std::cmp::Ordering::Less,
+                (ResourceEntryName::ID(_), ResourceEntryName::Name(_)) => {
+                    std::cmp::Ordering::Greater
+                }
+                (ResourceEntryName::ID(left), ResourceEntryName::ID(right)) => left.cmp(right),
+            },
+        );
+        entries
+    }
+
     fn build(&self, virtual_address: u32) -> Vec<u8> {
         let mut tables_offset = 0;
         let mut strings_offset = 0;
@@ -465,7 +490,8 @@ impl ResourceTable {
 
         let mut next_table_offset = 0u32;
         let mut next_table_sizes = 0u32;
-        for (name, entry) in &self.entries {
+        let entries = self.sorted_entries();
+        for (name, entry) in &entries {
             strings_data.extend(name.string_data());
             let name_offset_or_integer_id = if name.string_size() > 0 {
                 *strings_offset | 0x80000000
@@ -510,7 +536,7 @@ impl ResourceTable {
         }
         *tables_offset += next_table_offset;
 
-        for (_, entry) in &self.entries {
+        for (_, entry) in entries {
             match entry {
                 ResourceEntry::Table(table) => {
                     let (t_tables_data, t_strings_data, t_descriptions_data, t_data_data) = table
