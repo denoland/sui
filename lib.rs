@@ -80,6 +80,7 @@ use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 pub mod apple_codesign;
 pub mod intel_mac;
+mod macho_shift;
 
 // libsui's own minimal PE resource writer, reduced from the BSD-2-Clause
 // `editpe` crate. See pe_edit.rs and LICENSE-editpe.
@@ -533,6 +534,11 @@ pub struct Macho {
 
 pub(crate) const SEGNAME: [u8; 16] = *b"__SUI\0\0\0\0\0\0\0\0\0\0\0";
 
+/// Header padding the `__SUI` segment consumes: its `LC_SEGMENT_64` plus the
+/// one section entry that follows it.
+const NEW_SEGMENT_CMDSIZE: u64 =
+    (size_of::<SegmentCommand64>() + size_of::<Section64>()) as u64;
+
 /// Remove an `LC_CODE_SIGNATURE` load command and its `__LINKEDIT` blob from a
 /// Mach-O image, returning the stripped bytes and the updated header.
 ///
@@ -629,7 +635,9 @@ impl Macho {
             (obj, header)
         };
 
-        let mut commands: Vec<(u32, u32, usize)> = Vec::with_capacity(header.ncmds as usize);
+        // Not `with_capacity(ncmds)`: the count is untrusted and reserving
+        // from it turns a 4-byte edit into a huge allocation.
+        let mut commands: Vec<(u32, u32, usize)> = Vec::new();
 
         let mut offset = size_of::<Header64>();
         let mut linkedit_cmd = None;
@@ -675,12 +683,55 @@ impl Macho {
         })
     }
 
+    /// File offset of the first byte of real image content that follows the
+    /// load commands.
+    ///
+    /// Everything between the end of the load commands and this offset is
+    /// linker-reserved header padding (`ld -headerpad`). That padding is the
+    /// *only* place a new load command can go: load commands must be
+    /// contiguous with the header, while every section and segment is pinned
+    /// to its file offset by addresses baked into the linked image.
+    fn header_pad_limit(&self) -> Result<u64, Error> {
+        let mut limit = self.linkedit_cmd.fileoff;
+
+        for (cmd, _, offset) in &self.commands {
+            if *cmd != LC_SEGMENT_64 {
+                continue;
+            }
+            let seg = SegmentCommand64::read_from_prefix(&self.data[*offset..])
+                .ok_or(Error::InvalidObject("Failed to read segment command"))?;
+            // __TEXT starts at file offset 0 (it covers the header itself), so
+            // it never bounds the padding; its sections below do.
+            if seg.fileoff > 0 && seg.filesize > 0 {
+                limit = limit.min(seg.fileoff);
+            }
+
+            let mut sect_offset = *offset + size_of::<SegmentCommand64>();
+            for _ in 0..seg.nsects {
+                let sect = Section64::read_from_prefix(&self.data[sect_offset..])
+                    .ok_or(Error::InvalidObject("Failed to read section"))?;
+                // A zero offset marks a zerofill section, which takes no file space.
+                if sect.offset > 0 && sect.size > 0 {
+                    limit = limit.min(sect.offset as u64);
+                }
+                sect_offset += size_of::<Section64>();
+            }
+        }
+
+        Ok(limit)
+    }
+
     /// Write a section into the Mach-O file.
     ///
     /// `name` is the Mach-O section name. The Mach-O format stores section
     /// names in a fixed-size 16-byte field, so `name` must be at most
     /// **16 bytes** long. Names longer than 16 bytes return
     /// [`Error::InvalidObject`] instead of panicking.
+    ///
+    /// Adding the `__SUI` segment costs a `LC_SEGMENT_64` plus one section
+    /// entry in the load command region. When the input executable was linked
+    /// with less header padding than that — a stock `cargo build` binary often
+    /// has only 48 bytes — the image is first pushed down a page to make room.
     pub fn write_section(mut self, name: &str, sectdata: Vec<u8>) -> Result<Self, Error> {
         if name.len() > 16 {
             return Err(Error::InvalidObject(
@@ -689,12 +740,42 @@ impl Macho {
         }
 
         /* x86_64 */
+        // x86_64 appends its payload past the end of the file rather than
+        // adding a segment, so it needs no room in the load commands.
         if self.header.cputype != CPU_TYPE_ARM_64 {
             self.sectdata = Some(sectdata);
             return Ok(self);
         }
 
         /* arm64 */
+        // The new load command is carved out of the header padding, and
+        // `build` keeps every later file offset exactly where it was by
+        // dropping that many padding bytes. Writing it into padding that isn't
+        // there would silently clobber the first bytes of __TEXT, which shows
+        // up at runtime as SIGILL.
+        let pad_limit = self.header_pad_limit()?;
+        let cmds_end = size_of::<Header64>() as u64 + self.header.sizeofcmds as u64;
+        if pad_limit >= cmds_end + NEW_SEGMENT_CMDSIZE {
+            return self.write_section_in_place(name, sectdata);
+        }
+
+        let shortfall = (cmds_end + NEW_SEGMENT_CMDSIZE).saturating_sub(pad_limit);
+        let width = align(shortfall, 0x4000).max(0x4000);
+        // Growing calls the in-place writer directly rather than recursing, so
+        // a shift that somehow fell short can only error, never loop.
+        Self::from(macho_shift::shift(self.data, width)?)?
+            .write_section_in_place(name, sectdata)
+    }
+
+    /// Add the `__SUI` segment, assuming the header padding already fits it.
+    fn write_section_in_place(mut self, name: &str, sectdata: Vec<u8>) -> Result<Self, Error> {
+        let cmds_end = size_of::<Header64>() as u64 + self.header.sizeofcmds as u64;
+        if self.header_pad_limit()? < cmds_end + NEW_SEGMENT_CMDSIZE {
+            return Err(Error::InvalidObject(
+                "Failed to grow the Mach-O header padding",
+            ));
+        }
+
         // Must run before the __LINKEDIT offsets below are shifted, while the
         // chained fixups blob is still where its load command says it is.
         self.widen_chained_fixups()?;
@@ -1969,6 +2050,104 @@ mod tests {
         );
     }
 
+    const TEXT_FILL: u8 = 0xCC;
+    const TEXT_SIZE: usize = 64;
+    /// End of the load commands in the fixtures built by `macho_with_text_at`.
+    const CMDS_END: usize = size_of::<Header64>()
+        + size_of::<SegmentCommand64>() * 2
+        + size_of::<Section64>()
+        + SYMTAB_CMD_SIZE;
+    const SYMTAB_CMD_SIZE: usize = 24;
+    /// Header padding consumed by the `__SUI` segment plus its section entry.
+    const NEEDED_PAD: usize = size_of::<SegmentCommand64>() + size_of::<Section64>();
+
+    /// Build a minimal arm64 Mach-O whose `__TEXT` holds one section starting
+    /// at `text_fileoff`, so the header padding is `text_fileoff - cmds_end`.
+    fn macho_with_text_at(text_fileoff: usize) -> Vec<u8> {
+        const HEADER_SIZE: usize = size_of::<Header64>();
+        const SEG_SIZE: usize = size_of::<SegmentCommand64>();
+        const SECT_SIZE: usize = size_of::<Section64>();
+
+        let sizeofcmds = SEG_SIZE + SECT_SIZE + SEG_SIZE + SYMTAB_CMD_SIZE;
+        assert!(text_fileoff >= HEADER_SIZE + sizeofcmds);
+        let linkedit_fileoff = align((text_fileoff + TEXT_SIZE) as u64, 0x4000) as usize;
+        let linkedit_filesize: u64 = 32;
+
+        let header = Header64 {
+            magic: 0xfeedfacf,
+            cputype: CPU_TYPE_ARM_64,
+            cpusubtype: 0,
+            filetype: 2,
+            ncmds: 3,
+            sizeofcmds: sizeofcmds as u32,
+            flags: 0,
+            reserved: 0,
+        };
+
+        let text_seg = SegmentCommand64 {
+            cmd: LC_SEGMENT_64,
+            cmdsize: (SEG_SIZE + SECT_SIZE) as u32,
+            segname: *b"__TEXT\0\0\0\0\0\0\0\0\0\0",
+            vmaddr: 0x1_0000_0000,
+            vmsize: linkedit_fileoff as u64,
+            fileoff: 0,
+            filesize: linkedit_fileoff as u64,
+            maxprot: 5,
+            initprot: 5,
+            nsects: 1,
+            flags: 0,
+        };
+
+        let text_sect = Section64 {
+            sectname: *b"__text\0\0\0\0\0\0\0\0\0\0",
+            segname: *b"__TEXT\0\0\0\0\0\0\0\0\0\0",
+            addr: 0x1_0000_0000 + text_fileoff as u64,
+            size: TEXT_SIZE as u64,
+            offset: text_fileoff as u32,
+            align: 2,
+            reloff: 0,
+            nreloc: 0,
+            flags: 0x8000_0400,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+        };
+
+        let linkedit_seg = SegmentCommand64 {
+            cmd: LC_SEGMENT_64,
+            cmdsize: SEG_SIZE as u32,
+            segname: *b"__LINKEDIT\0\0\0\0\0\0",
+            vmaddr: 0x1_0000_0000 + linkedit_fileoff as u64,
+            vmsize: 0x4000,
+            fileoff: linkedit_fileoff as u64,
+            filesize: linkedit_filesize,
+            maxprot: 1,
+            initprot: 1,
+            nsects: 0,
+            flags: 0,
+        };
+
+        let mut obj = Vec::new();
+        obj.extend_from_slice(header.as_bytes());
+        obj.extend_from_slice(text_seg.as_bytes());
+        obj.extend_from_slice(text_sect.as_bytes());
+        obj.extend_from_slice(linkedit_seg.as_bytes());
+        // An LC_SYMTAB claiming the whole of __LINKEDIT as its string table;
+        // growing the header pad relays the region out from its commands, so
+        // every byte in there has to belong to one.
+        obj.extend_from_slice(&LC_SYMTAB.to_le_bytes());
+        obj.extend_from_slice(&(SYMTAB_CMD_SIZE as u32).to_le_bytes());
+        obj.extend_from_slice(&0u32.to_le_bytes()); // symoff
+        obj.extend_from_slice(&0u32.to_le_bytes()); // nsyms
+        obj.extend_from_slice(&(linkedit_fileoff as u32).to_le_bytes()); // stroff
+        obj.extend_from_slice(&(linkedit_filesize as u32).to_le_bytes()); // strsize
+        obj.resize(text_fileoff, 0); // header padding
+        obj.extend_from_slice(&[TEXT_FILL; TEXT_SIZE]);
+        obj.resize(linkedit_fileoff, 0);
+        obj.extend_from_slice(&vec![0xAB; linkedit_filesize as usize]);
+        obj
+    }
+
     /// Count `LC_SEGMENT_64` commands, and read `seg_count` out of the image's
     /// `dyld_chained_starts_in_image`.
     fn segment_and_fixup_counts(obj: &[u8]) -> Option<(u32, u32)> {
@@ -2020,4 +2199,84 @@ mod tests {
         assert_eq!(segments, seg_count, "seg_count did not follow __SUI");
     }
 
+    /// Find a segment's `(fileoff, filesize)` in a built image.
+    fn find_segment(obj: &[u8], name: &[u8]) -> Option<(u64, u64)> {
+        let header = Header64::read_from_prefix(obj)?;
+        let mut offset = size_of::<Header64>();
+        for _ in 0..header.ncmds {
+            let cmd = u32::from_le_bytes(obj[offset..offset + 4].try_into().unwrap());
+            let cmdsize = u32::from_le_bytes(obj[offset + 4..offset + 8].try_into().unwrap());
+            if cmd == LC_SEGMENT_64 {
+                let seg = SegmentCommand64::read_from_prefix(&obj[offset..])?;
+                if seg.segname[..name.len()] == *name {
+                    return Some((seg.fileoff, seg.filesize));
+                }
+            }
+            offset += cmdsize as usize;
+        }
+        None
+    }
+
+    // Regression test for denoland/sui#82. A binary linked with a header pad
+    // too small for the new LC_SEGMENT_64 + section used to be accepted, and
+    // `build` then overwrote the first bytes of __TEXT with load command bytes
+    // (SIGILL at runtime). The image must be pushed down far enough to fit the
+    // command instead, carrying __TEXT with it intact.
+    #[test]
+    fn grows_header_padding_when_too_small() {
+        // 48 bytes is what a stock `cargo build` binary had in the report.
+        for pad in [0, 48, NEEDED_PAD - 1] {
+            let text_fileoff = CMDS_END + pad;
+            let obj = macho_with_text_at(text_fileoff);
+
+            let mut out = Vec::new();
+            Macho::from(obj)
+                .unwrap()
+                .write_section("__sui", vec![0u8; 16])
+                .unwrap()
+                .build(&mut out)
+                .unwrap();
+
+            let header = Header64::read_from_prefix(&out[..]).unwrap();
+            let cmds_end = size_of::<Header64>() + header.sizeofcmds as usize;
+            assert!(
+                cmds_end + NEEDED_PAD <= text_fileoff + 0x4000,
+                "{pad}-byte pad: load commands still overrun __TEXT"
+            );
+
+            // __TEXT moved down by exactly the page that was inserted, and its
+            // contents came along untouched.
+            let moved = text_fileoff + 0x4000;
+            assert_eq!(
+                &out[moved..moved + TEXT_SIZE],
+                &[TEXT_FILL; TEXT_SIZE],
+                "{pad}-byte pad: __TEXT was clobbered"
+            );
+
+            let (sui_off, sui_size) =
+                find_segment(&out, b"__SUI\0").expect("__SUI segment missing");
+            assert!(sui_size > 0 && sui_off > 0, "{pad}-byte pad: empty __SUI");
+        }
+    }
+
+    // The complement: with room to spare nothing moves at all.
+    #[test]
+    fn preserves_text_when_header_padding_suffices() {
+        let text_fileoff = CMDS_END + NEEDED_PAD;
+
+        let obj = macho_with_text_at(text_fileoff);
+        let mut out = Vec::new();
+        Macho::from(obj)
+            .unwrap()
+            .write_section("__sui", vec![0u8; 16])
+            .unwrap()
+            .build(&mut out)
+            .unwrap();
+
+        assert_eq!(
+            &out[text_fileoff..text_fileoff + TEXT_SIZE],
+            &[TEXT_FILL; TEXT_SIZE],
+            "__TEXT contents moved or were clobbered"
+        );
+    }
 }
