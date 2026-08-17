@@ -135,7 +135,6 @@ impl MachoSigner {
             if cmd == LC_SEGMENT_64 {
                 let segcmd = SegmentCommand64::read_from_prefix(&obj[offset..])
                     .ok_or(Error::InvalidObject("Failed to read segment command"))?;
-                // Convert fixed size array terminated by null byte to string
                 let segname = String::from_utf8_lossy(&segcmd.segname);
                 let segname = segname.trim_end_matches('\0');
 
@@ -172,12 +171,10 @@ impl MachoSigner {
         let sz = size_of::<SuperBlob>() + size_of::<Blob>() + c_dir_sz;
 
         if self.sig_sz != sz {
-            // Update the load command
             let cs_cmd = LinkeditDataCommand::mut_from_prefix(&mut self.data[self.cs_cmd_off..])
                 .ok_or(Error::InvalidObject("Failed to read linkedit data command"))?;
             cs_cmd.datasize = sz as u32;
 
-            // Update __LINKEDIT segment
             let seg_sz = self.sig_off + sz - self.linkedit_seg.fileoff as usize;
             let linkedit_seg =
                 SegmentCommand64::mut_from_prefix(&mut self.data[self.linkedit_off..])
