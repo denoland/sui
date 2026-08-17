@@ -253,11 +253,16 @@ impl Shifter {
             .position(|s| s.seg.segname[..SEG_LINKEDIT.len()] == *SEG_LINKEDIT)
             .ok_or_else(|| invalid("Linkedit segment not found"))?;
 
+        // __TEXT's address comes out of the file like everything else.
+        let lc_end_va = text_vmaddr
+            .checked_add(lc_end)
+            .ok_or_else(|| invalid("__TEXT address overflows"))?;
+
         Ok(Self {
             data,
             width,
             lc_end,
-            lc_end_va: text_vmaddr + lc_end,
+            lc_end_va,
             segments,
             commands,
             blobs: Vec::new(),
@@ -272,21 +277,26 @@ impl Shifter {
     /// distance from the image base are the same number. Export trie
     /// addresses, unwind info, function starts and chained fixup targets are
     /// all image-base offsets and use this too.
-    fn shift_off(&self, value: u64) -> u64 {
-        if value >= self.lc_end {
-            value + self.width
-        } else {
-            value
-        }
+    fn shift_off(&self, value: u64) -> Result<u64, Error> {
+        self.moved(value, self.lc_end)
     }
 
     /// Move a virtual address.
-    fn shift_va(&self, value: u64) -> u64 {
-        if value >= self.lc_end_va {
-            value + self.width
-        } else {
-            value
+    fn shift_va(&self, value: u64) -> Result<u64, Error> {
+        self.moved(value, self.lc_end_va)
+    }
+
+    /// Add `width` to anything at or past `floor`.
+    ///
+    /// A value so large that it overflows is not describing anything real, so
+    /// treat it the way the rest of this module treats nonsense.
+    fn moved(&self, value: u64, floor: u64) -> Result<u64, Error> {
+        if value < floor {
+            return Ok(value);
         }
+        value
+            .checked_add(self.width)
+            .ok_or_else(|| invalid("Shifted value overflows"))
     }
 
     fn run(mut self) -> Result<Vec<u8>, Error> {
@@ -584,13 +594,13 @@ impl Shifter {
             let mut seg = self.segments[index].seg.clone();
             let grows = is_text(&seg);
 
-            seg.fileoff = self.shift_off(self.segments[index].old_fileoff);
-            seg.vmaddr = self.shift_va(self.segments[index].old_vmaddr);
+            seg.fileoff = self.shift_off(self.segments[index].old_fileoff)?;
+            seg.vmaddr = self.shift_va(self.segments[index].old_vmaddr)?;
             if grows {
                 // __TEXT swallows the new gap: it starts at file offset 0 and
                 // covers the header, so it is the segment that got bigger.
-                seg.filesize += self.width;
-                seg.vmsize += self.width;
+                seg.filesize = self.moved(seg.filesize, 0)?;
+                seg.vmsize = self.moved(seg.vmsize, 0)?;
             }
 
             let nsects = seg.nsects as usize;
@@ -608,10 +618,10 @@ impl Shifter {
                 // A zero file offset marks a zerofill section; it owns no file
                 // bytes but its address still moves with the rest.
                 if sect.offset as u64 >= self.lc_end {
-                    sect.offset = u32::try_from(sect.offset as u64 + self.width)
+                    sect.offset = u32::try_from(self.moved(sect.offset as u64, 0)?)
                         .map_err(|_| invalid("Mach-O file would exceed 4 GiB"))?;
                 }
-                sect.addr = self.shift_va(sect.addr);
+                sect.addr = self.shift_va(sect.addr)?;
                 write_at(&mut self.data, sect_offset, sect.as_bytes())?;
                 sect_offset += size_of::<Section64>();
             }
@@ -630,7 +640,7 @@ impl Shifter {
         // entryoff is measured from the header, so it tracks the code rather
         // than the file layout.
         let entryoff = read_u64(&self.data, offset + 8)?;
-        let shifted = self.shift_off(entryoff);
+        let shifted = self.shift_off(entryoff)?;
         write_u64(&mut self.data, offset + 8, shifted)
     }
 
@@ -743,7 +753,10 @@ impl Shifter {
         // is proof there is nothing to lose, rather than a tolerance.
         const MAX_ALIGN: u64 = 16;
         let seg = &self.segments[self.linkedit_index].seg;
-        let linkedit_end = seg.fileoff + seg.filesize;
+        let linkedit_end = seg
+            .fileoff
+            .checked_add(seg.filesize)
+            .ok_or_else(|| invalid("__LINKEDIT range overflows"))?;
         let mut cursor = seg.fileoff;
 
         let unaccounted = || {
@@ -775,7 +788,10 @@ impl Shifter {
             {
                 return Err(unaccounted());
             }
-            cursor = blob.old_off + blob.size as u64;
+            cursor = blob
+                .old_off
+                .checked_add(blob.size as u64)
+                .ok_or_else(|| invalid("__LINKEDIT blob range overflows"))?;
         }
 
         self.blobs = blobs;
@@ -880,7 +896,7 @@ impl Shifter {
             };
 
             if carries_address && sym.n_value >= self.lc_end_va {
-                sym.n_value += self.width;
+                sym.n_value = self.moved(sym.n_value, 0)?;
                 write_at(&mut self.data, at, sym.as_bytes())?;
             }
         }
@@ -899,7 +915,7 @@ impl Shifter {
         // struct data_in_code_entry { uint32_t offset; uint16_t length; uint16_t kind; }
         for at in (dataoff..dataoff + datasize).step_by(8) {
             let value = read_u32(&self.data, at)? as u64;
-            let shifted = u32::try_from(self.shift_off(value))
+            let shifted = u32::try_from(self.shift_off(value)?)
                 .map_err(|_| invalid("Mach-O file would exceed 4 GiB"))?;
             write_u32(&mut self.data, at, shifted)?;
         }
@@ -922,7 +938,7 @@ impl Shifter {
         if first == 0 {
             return Ok(());
         }
-        let shifted = self.shift_off(first);
+        let shifted = self.shift_off(first)?;
 
         let mut rebuilt = Vec::with_capacity(datasize);
         // Keep the encoding the same width when the value still fits, so the
@@ -1035,7 +1051,7 @@ impl Shifter {
         if value == 0 {
             return Ok(());
         }
-        let shifted = u32::try_from(self.shift_off(value))
+        let shifted = u32::try_from(self.shift_off(value)?)
             .map_err(|_| invalid("Mach-O file would exceed 4 GiB"))?;
         write_u32(&mut self.data, at, shifted)
     }
@@ -1079,14 +1095,30 @@ impl Shifter {
         let mut at = rebase_off;
         let end = rebase_off + rebase_size;
 
+        // Validating each slot here bounds `slots`: a bogus repeat count runs
+        // off the end of the file within a few iterations instead of pushing
+        // billions of entries.
         let push = |slots: &mut Vec<u64>, seg_index: usize, seg_offset: u64| -> Result<(), Error> {
             let seg = self
                 .segments
                 .get(seg_index)
                 .ok_or_else(|| invalid("Rebase opcode names an unknown segment"))?;
-            slots.push(seg.old_fileoff + seg_offset);
+            let slot = seg
+                .old_fileoff
+                .checked_add(seg_offset)
+                .ok_or_else(|| invalid("Rebase offset overflows"))?;
+            slice(&self.data, slot as usize, 8)?;
+            slots.push(slot);
             Ok(())
         };
+
+        // Every advance of the cursor comes from the file, so none of them can
+        // be trusted not to wrap.
+        fn advance(offset: u64, by: u64) -> Result<u64, Error> {
+            offset
+                .checked_add(by)
+                .ok_or_else(|| invalid("Rebase offset overflows"))
+        }
 
         while at < end {
             let byte = *self
@@ -1108,9 +1140,9 @@ impl Shifter {
                 ADD_ADDR_ULEB => {
                     let (value, len) = read_uleb(&self.data, at)?;
                     at += len;
-                    seg_offset = seg_offset.wrapping_add(value);
+                    seg_offset = advance(seg_offset, value)?;
                 }
-                ADD_ADDR_IMM_SCALED => seg_offset = seg_offset.wrapping_add(imm * 8),
+                ADD_ADDR_IMM_SCALED => seg_offset = advance(seg_offset, imm * 8)?,
                 DO_REBASE_IMM_TIMES | DO_REBASE_ULEB_TIMES => {
                     let count = if opcode == DO_REBASE_IMM_TIMES {
                         imm
@@ -1124,7 +1156,7 @@ impl Shifter {
                     }
                     for _ in 0..count {
                         push(&mut slots, seg_index, seg_offset)?;
-                        seg_offset += 8;
+                        seg_offset = advance(seg_offset, 8)?;
                     }
                 }
                 DO_REBASE_ADD_ADDR_ULEB => {
@@ -1134,7 +1166,7 @@ impl Shifter {
                         return Err(invalid("Unsupported rebase type"));
                     }
                     push(&mut slots, seg_index, seg_offset)?;
-                    seg_offset += 8 + value;
+                    seg_offset = advance(seg_offset, advance(8, value)?)?;
                 }
                 DO_REBASE_ULEB_TIMES_SKIPPING_ULEB => {
                     let (count, len) = read_uleb(&self.data, at)?;
@@ -1144,9 +1176,10 @@ impl Shifter {
                     if kind != REBASE_TYPE_POINTER {
                         return Err(invalid("Unsupported rebase type"));
                     }
+                    let stride = advance(8, skip)?;
                     for _ in 0..count {
                         push(&mut slots, seg_index, seg_offset)?;
-                        seg_offset += 8 + skip;
+                        seg_offset = advance(seg_offset, stride)?;
                     }
                 }
                 _ => return Err(invalid("Unknown rebase opcode")),
@@ -1156,7 +1189,8 @@ impl Shifter {
         for slot in slots {
             let value = read_u64(&self.data, slot as usize)?;
             if value >= self.lc_end_va {
-                write_u64(&mut self.data, slot as usize, value + self.width)?;
+                let moved = self.moved(value, 0)?;
+                write_u64(&mut self.data, slot as usize, moved)?;
             }
         }
         Ok(())
@@ -1217,7 +1251,7 @@ impl Shifter {
             let seg_fileoff = seg.old_fileoff;
 
             // segment_offset is measured from the image base.
-            let shifted_segment_offset = self.shift_off(segment_offset);
+            let shifted_segment_offset = self.shift_off(segment_offset)?;
             write_u64(&mut self.data, info + 8, shifted_segment_offset)?;
 
             for page in 0..page_count {
@@ -1242,9 +1276,9 @@ impl Shifter {
                     if !is_bind {
                         let target = value & 0xf_ffff_ffff;
                         let shifted = if pointer_format == DYLD_CHAINED_PTR_64_OFFSET {
-                            self.shift_off(target)
+                            self.shift_off(target)?
                         } else {
-                            self.shift_va(target)
+                            self.shift_va(target)?
                         };
                         if shifted != target {
                             let rest = value & !0xf_ffff_ffff;
@@ -1337,14 +1371,14 @@ impl Shifter {
         let moved = if flags & KIND_MASK == KIND_ABSOLUTE {
             address
         } else {
-            self.shift_off(address)
+            self.shift_off(address)?
         };
         encode_uleb(&mut out, moved);
 
         if flags & STUB_AND_RESOLVER != 0 {
             let (resolver, len) = read_uleb(payload, at)?;
             at += len;
-            encode_uleb(&mut out, self.shift_off(resolver));
+            encode_uleb(&mut out, self.shift_off(resolver)?);
         }
 
         out.extend_from_slice(payload.get(at..).unwrap_or_default());

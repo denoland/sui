@@ -48,3 +48,9 @@ Thumbs.db
 vendor/lief/lief.*.so
 vendor/lief/build/
 build/
+
+# cargo-fuzz working state: the corpus is regenerable and the artifacts are
+# reproducers for crashes that are already fixed and covered by tests.
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/target/

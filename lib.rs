@@ -565,22 +565,23 @@ fn strip_code_signature(mut obj: Vec<u8>) -> Result<(Vec<u8>, Header64), Error> 
     let mut linkedit_off: Option<usize> = None;
 
     for _ in 0..header.ncmds as usize {
-        if offset + 8 > obj.len() {
-            return Err(Error::InvalidObject("Truncated load commands"));
+        let head = slice(&obj, offset, 8)?;
+        let cmd = u32::from_le_bytes(head[..4].try_into().unwrap());
+        let cmdsize = u32::from_le_bytes(head[4..].try_into().unwrap()) as usize;
+        if cmdsize < 8 {
+            return Err(Error::InvalidObject("Load command smaller than its header"));
         }
-        let cmd = u32::from_le_bytes(obj[offset..offset + 4].try_into().unwrap());
-        let cmdsize = u32::from_le_bytes(obj[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        slice(&obj, offset, cmdsize)?;
 
         if cmd == LC_CODE_SIGNATURE {
-            if offset + 16 > obj.len() {
-                return Err(Error::InvalidObject("Truncated code signature command"));
-            }
-            let dataoff = u32::from_le_bytes(obj[offset + 8..offset + 12].try_into().unwrap());
-            let datasize = u32::from_le_bytes(obj[offset + 12..offset + 16].try_into().unwrap());
+            let body = slice(&obj, offset + 8, 8)?;
+            let dataoff = u32::from_le_bytes(body[..4].try_into().unwrap());
+            let datasize = u32::from_le_bytes(body[4..].try_into().unwrap());
             sig = Some((offset, cmdsize, dataoff as u64, datasize as u64));
         } else if cmd == LC_SEGMENT_64 {
-            let segcmd = SegmentCommand64::read_from_prefix(&obj[offset..])
-                .ok_or(Error::InvalidObject("Failed to read segment command"))?;
+            let segcmd =
+                SegmentCommand64::read_from_prefix(slice(&obj, offset, size_of::<SegmentCommand64>())?)
+                    .ok_or(Error::InvalidObject("Failed to read segment command"))?;
             if segcmd.segname[..SEG_LINKEDIT.len()] == *SEG_LINKEDIT {
                 linkedit_off = Some(offset);
             }
@@ -597,8 +598,12 @@ fn strip_code_signature(mut obj: Vec<u8>) -> Result<(Vec<u8>, Header64), Error> 
     // space rather than risk corrupting a nonstandard image.
     if dataoff + datasize == obj.len() as u64 {
         if let Some(le_off) = linkedit_off {
-            let mut le = SegmentCommand64::read_from_prefix(&obj[le_off..])
-                .ok_or(Error::InvalidObject("Failed to read linkedit segment"))?;
+            let mut le = SegmentCommand64::read_from_prefix(slice(
+                &obj,
+                le_off,
+                size_of::<SegmentCommand64>(),
+            )?)
+            .ok_or(Error::InvalidObject("Failed to read linkedit segment"))?;
             le.filesize = le.filesize.saturating_sub(datasize);
             obj[le_off..le_off + size_of::<SegmentCommand64>()].copy_from_slice(le.as_bytes());
         }
@@ -610,12 +615,21 @@ fn strip_code_signature(mut obj: Vec<u8>) -> Result<(Vec<u8>, Header64), Error> 
     // size (the freed bytes become header slack), so every segment file offset
     // is untouched.
     let cmds_end = size_of::<Header64>() + header.sizeofcmds as usize;
-    obj.copy_within(cmd_off + cmdsize..cmds_end, cmd_off);
-    for byte in &mut obj[cmds_end - cmdsize..cmds_end] {
-        *byte = 0;
-    }
+    // Truncating above can have moved the end of the file, and none of these
+    // offsets were trustworthy to begin with.
+    let tail = cmd_off
+        .checked_add(cmdsize)
+        .filter(|tail| *tail <= cmds_end && cmds_end <= obj.len())
+        .ok_or(Error::InvalidObject(
+            "Code signature command lies outside the load commands",
+        ))?;
+    obj.copy_within(tail..cmds_end, cmd_off);
+    obj[cmds_end - cmdsize..cmds_end].fill(0);
     header.ncmds -= 1;
-    header.sizeofcmds -= cmdsize as u32;
+    header.sizeofcmds = header
+        .sizeofcmds
+        .checked_sub(cmdsize as u32)
+        .ok_or(Error::InvalidObject("Load command larger than the region"))?;
     obj[..size_of::<Header64>()].copy_from_slice(header.as_bytes());
 
     Ok((obj, header))
@@ -996,7 +1010,22 @@ impl Macho {
         let starts = blob + starts_offset;
         let seg_count = read(&self.data, starts)? as u64;
 
-        let mut offsets = Vec::with_capacity(seg_count as usize);
+        // The structure is defined as one entry per segment, so anything else
+        // is malformed. Checking up front bounds the array read below: a bogus
+        // count would otherwise reserve tens of gigabytes before the first
+        // out-of-range read could fail.
+        let segment_count = self
+            .commands
+            .iter()
+            .filter(|(cmd, _, _)| *cmd == LC_SEGMENT_64)
+            .count() as u64;
+        if seg_count != segment_count {
+            return Err(Error::InvalidObject(
+                "dyld_chained_starts_in_image does not describe every segment",
+            ));
+        }
+
+        let mut offsets = Vec::new();
         for index in 0..seg_count {
             offsets.push(read(&self.data, starts + 4 + index * 4)? as u64);
         }
@@ -2213,6 +2242,38 @@ mod tests {
 
         let (segments, seg_count) = segment_and_fixup_counts(&out).unwrap();
         assert_eq!(segments, seg_count, "seg_count did not follow __SUI");
+    }
+
+    // A `seg_count` that disagrees with the load commands used to index past
+    // the end of the offsets array. Found by fuzzing.
+    #[test]
+    fn short_chained_fixups_seg_count_is_rejected() {
+        let mut obj = include_bytes!("tests/exec_mach64_chained").to_vec();
+
+        // Walk to LC_DYLD_CHAINED_FIXUPS and shrink the count it declares.
+        let header = Header64::read_from_prefix(&obj[..]).unwrap();
+        let mut offset = size_of::<Header64>();
+        let mut starts = None;
+        for _ in 0..header.ncmds {
+            let cmd = u32::from_le_bytes(obj[offset..offset + 4].try_into().unwrap());
+            let cmdsize = u32::from_le_bytes(obj[offset + 4..offset + 8].try_into().unwrap());
+            if cmd == LC_DYLD_CHAINED_FIXUPS {
+                let blob =
+                    u32::from_le_bytes(obj[offset + 8..offset + 12].try_into().unwrap()) as usize;
+                starts = Some(
+                    blob + u32::from_le_bytes(obj[blob + 4..blob + 8].try_into().unwrap()) as usize,
+                );
+            }
+            offset += cmdsize as usize;
+        }
+        let starts = starts.expect("fixture should use chained fixups");
+        obj[starts..starts + 4].copy_from_slice(&1u32.to_le_bytes());
+
+        match Macho::from(obj).unwrap().write_section("__sui", vec![0u8; 16]) {
+            Err(Error::InvalidObject(_)) => {}
+            Err(other) => panic!("unexpected error: {other:?}"),
+            Ok(_) => panic!("a short seg_count was accepted"),
+        }
     }
 
     // The whole public path, not just the shift: a malformed image must be
