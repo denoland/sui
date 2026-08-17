@@ -533,57 +533,100 @@ pub struct Macho {
 
 pub(crate) const SEGNAME: [u8; 16] = *b"__SUI\0\0\0\0\0\0\0\0\0\0\0";
 
+/// Remove an `LC_CODE_SIGNATURE` load command and its `__LINKEDIT` blob from a
+/// Mach-O image, returning the stripped bytes and the updated header.
+///
+/// Inserting the `__SUI` segment invalidates any existing code signature (the
+/// Code Directory hashes no longer describe the file). On arm64 the output is
+/// re-signed by [`Macho::build_and_sign`], but x86_64 output from [`Macho::build`]
+/// is expected to run unsigned, and macOS refuses to execute an x86_64 binary
+/// that carries an *invalid* signature. Stripping up front — the pure-Rust
+/// equivalent of the old `codesign --remove-signature` step — leaves a clean
+/// unsigned image, so every offset computed downstream stays consistent.
+///
+/// Returns the input unchanged when it is not signed. The code signature blob
+/// is, by construction of every linker and `codesign`, the last bytes of both
+/// `__LINKEDIT` and the file; when that does not hold the load command is still
+/// removed (so the kernel does not validate it) and the now-orphaned blob is
+/// left in place as harmless dead space.
+fn strip_code_signature(mut obj: Vec<u8>) -> Result<(Vec<u8>, Header64), Error> {
+    let mut header = Header64::read_from_prefix(&obj)
+        .ok_or(Error::InvalidObject("Failed to read header"))?;
+
+    let mut offset = size_of::<Header64>();
+    let mut sig: Option<(usize, usize, u64, u64)> = None; // (cmd offset, cmdsize, dataoff, datasize)
+    let mut linkedit_off: Option<usize> = None;
+
+    for _ in 0..header.ncmds as usize {
+        if offset + 8 > obj.len() {
+            return Err(Error::InvalidObject("Truncated load commands"));
+        }
+        let cmd = u32::from_le_bytes(obj[offset..offset + 4].try_into().unwrap());
+        let cmdsize = u32::from_le_bytes(obj[offset + 4..offset + 8].try_into().unwrap()) as usize;
+
+        if cmd == LC_CODE_SIGNATURE {
+            if offset + 16 > obj.len() {
+                return Err(Error::InvalidObject("Truncated code signature command"));
+            }
+            let dataoff = u32::from_le_bytes(obj[offset + 8..offset + 12].try_into().unwrap());
+            let datasize = u32::from_le_bytes(obj[offset + 12..offset + 16].try_into().unwrap());
+            sig = Some((offset, cmdsize, dataoff as u64, datasize as u64));
+        } else if cmd == LC_SEGMENT_64 {
+            let segcmd = SegmentCommand64::read_from_prefix(&obj[offset..])
+                .ok_or(Error::InvalidObject("Failed to read segment command"))?;
+            if segcmd.segname[..SEG_LINKEDIT.len()] == *SEG_LINKEDIT {
+                linkedit_off = Some(offset);
+            }
+        }
+        offset += cmdsize;
+    }
+
+    let Some((cmd_off, cmdsize, dataoff, datasize)) = sig else {
+        return Ok((obj, header)); // not signed, nothing to strip
+    };
+
+    // Drop the signature blob and shrink __LINKEDIT, but only when the blob sits
+    // at the tail of the file (the standard layout). Otherwise leave it as dead
+    // space rather than risk corrupting a nonstandard image.
+    if dataoff + datasize == obj.len() as u64 {
+        if let Some(le_off) = linkedit_off {
+            let mut le = SegmentCommand64::read_from_prefix(&obj[le_off..])
+                .ok_or(Error::InvalidObject("Failed to read linkedit segment"))?;
+            le.filesize = le.filesize.saturating_sub(datasize);
+            obj[le_off..le_off + size_of::<SegmentCommand64>()].copy_from_slice(le.as_bytes());
+        }
+        obj.truncate(dataoff as usize);
+    }
+
+    // Remove the load command by compacting the ones after it up by `cmdsize`,
+    // then zero-filling the vacated tail. The command region keeps its physical
+    // size (the freed bytes become header slack), so every segment file offset
+    // is untouched.
+    let cmds_end = size_of::<Header64>() + header.sizeofcmds as usize;
+    obj.copy_within(cmd_off + cmdsize..cmds_end, cmd_off);
+    for byte in &mut obj[cmds_end - cmdsize..cmds_end] {
+        *byte = 0;
+    }
+    header.ncmds -= 1;
+    header.sizeofcmds -= cmdsize as u32;
+    obj[..size_of::<Header64>()].copy_from_slice(header.as_bytes());
+
+    Ok((obj, header))
+}
+
 impl Macho {
     pub fn from(obj: Vec<u8>) -> Result<Self, Error> {
         let header = Header64::read_from_prefix(&obj)
             .ok_or(Error::InvalidObject("Failed to read header"))?;
 
-        // Atomically strip code signature first for intel binaries.
-        #[cfg(target_vendor = "apple")]
-        let obj = if header.cputype != CPU_TYPE_ARM_64 {
-            use std::io::Write;
-
-            let tmp_dir = std::env::temp_dir();
-            std::fs::create_dir_all(&tmp_dir)?;
-            let tmp_path = tmp_dir.join(format!("sui_tmp_{}", std::process::id()));
-
-            let mut tmp_file = std::fs::File::create(&tmp_path)?;
-            tmp_file.write_all(&obj)?;
-            drop(tmp_file);
-
-            match std::process::Command::new("codesign")
-                .arg("--remove-signature")
-                .arg(&tmp_path)
-                .output()
-            {
-                Ok(output) => {
-                    if !output.status.success() {
-                        // If codesign fails, just use the original binary
-                        eprintln!(
-                            "Warning: Failed to remove code signature: {}",
-                            String::from_utf8_lossy(&output.stderr)
-                        );
-                        std::fs::remove_file(&tmp_path).ok();
-                        obj
-                    } else {
-                        // Read the stripped binary
-                        let stripped = std::fs::read(&tmp_path)?;
-                        std::fs::remove_file(&tmp_path).ok();
-                        stripped
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // codesign not found, skip it
-                    std::fs::remove_file(&tmp_path).ok();
-                    obj
-                }
-                Err(e) => {
-                    std::fs::remove_file(&tmp_path).ok();
-                    return Err(e.into());
-                }
-            }
+        // x86_64 input is typically ad-hoc signed by the linker. Inserting the
+        // __SUI segment invalidates that signature, and x86_64 `build()` output
+        // is expected to run unsigned, so strip it here. arm64 keeps its
+        // signature and is re-signed by `build_and_sign`.
+        let (obj, header) = if header.cputype != CPU_TYPE_ARM_64 {
+            strip_code_signature(obj)?
         } else {
-            obj
+            (obj, header)
         };
 
         let mut commands: Vec<(u32, u32, usize)> = Vec::with_capacity(header.ncmds as usize);
