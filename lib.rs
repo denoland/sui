@@ -80,6 +80,8 @@ use zerocopy::{AsBytes, FromBytes, FromZeroes};
 
 pub mod apple_codesign;
 pub mod intel_mac;
+mod macho_shift;
+use macho_shift::slice;
 
 // libsui's own minimal PE resource writer, reduced from the BSD-2-Clause
 // `editpe` crate. See pe_edit.rs and LICENSE-editpe.
@@ -533,79 +535,146 @@ pub struct Macho {
 
 pub(crate) const SEGNAME: [u8; 16] = *b"__SUI\0\0\0\0\0\0\0\0\0\0\0";
 
+/// Header padding the `__SUI` segment consumes: its `LC_SEGMENT_64` plus the
+/// one section entry that follows it.
+const NEW_SEGMENT_CMDSIZE: u64 =
+    (size_of::<SegmentCommand64>() + size_of::<Section64>()) as u64;
+
+/// Remove an `LC_CODE_SIGNATURE` load command and its `__LINKEDIT` blob from a
+/// Mach-O image, returning the stripped bytes and the updated header.
+///
+/// Inserting the `__SUI` segment invalidates any existing code signature (the
+/// Code Directory hashes no longer describe the file). On arm64 the output is
+/// re-signed by [`Macho::build_and_sign`], but x86_64 output from [`Macho::build`]
+/// is expected to run unsigned, and macOS refuses to execute an x86_64 binary
+/// that carries an *invalid* signature. Stripping up front — the pure-Rust
+/// equivalent of the old `codesign --remove-signature` step — leaves a clean
+/// unsigned image, so every offset computed downstream stays consistent.
+///
+/// Returns the input unchanged when it is not signed. The code signature blob
+/// is, by construction of every linker and `codesign`, the last bytes of both
+/// `__LINKEDIT` and the file; when that does not hold the load command is still
+/// removed (so the kernel does not validate it) and the now-orphaned blob is
+/// left in place as dead space. That is harmless when the `__SUI` segment fits
+/// in the existing header padding, but growing the padding relays `__LINKEDIT`
+/// out from its load commands, and an orphaned blob no command describes is
+/// rejected there rather than silently dropped.
+fn strip_code_signature(mut obj: Vec<u8>) -> Result<(Vec<u8>, Header64), Error> {
+    let mut header = Header64::read_from_prefix(&obj)
+        .ok_or(Error::InvalidObject("Failed to read header"))?;
+
+    let mut offset = size_of::<Header64>();
+    let mut sig: Option<(usize, usize, u64, u64)> = None; // (cmd offset, cmdsize, dataoff, datasize)
+    let mut linkedit_off: Option<usize> = None;
+
+    for _ in 0..header.ncmds as usize {
+        let head = slice(&obj, offset, 8)?;
+        let cmd = u32::from_le_bytes(head[..4].try_into().unwrap());
+        let cmdsize = u32::from_le_bytes(head[4..].try_into().unwrap()) as usize;
+        if cmdsize < 8 {
+            return Err(Error::InvalidObject("Load command smaller than its header"));
+        }
+        slice(&obj, offset, cmdsize)?;
+
+        if cmd == LC_CODE_SIGNATURE {
+            let body = slice(&obj, offset + 8, 8)?;
+            let dataoff = u32::from_le_bytes(body[..4].try_into().unwrap());
+            let datasize = u32::from_le_bytes(body[4..].try_into().unwrap());
+            sig = Some((offset, cmdsize, dataoff as u64, datasize as u64));
+        } else if cmd == LC_SEGMENT_64 {
+            let segcmd =
+                SegmentCommand64::read_from_prefix(slice(&obj, offset, size_of::<SegmentCommand64>())?)
+                    .ok_or(Error::InvalidObject("Failed to read segment command"))?;
+            if segcmd.segname[..SEG_LINKEDIT.len()] == *SEG_LINKEDIT {
+                linkedit_off = Some(offset);
+            }
+        }
+        offset += cmdsize;
+    }
+
+    let Some((cmd_off, cmdsize, dataoff, datasize)) = sig else {
+        return Ok((obj, header)); // not signed, nothing to strip
+    };
+
+    // Drop the signature blob and shrink __LINKEDIT, but only when the blob sits
+    // at the tail of the file (the standard layout). Otherwise leave it as dead
+    // space rather than risk corrupting a nonstandard image.
+    if dataoff + datasize == obj.len() as u64 {
+        if let Some(le_off) = linkedit_off {
+            let mut le = SegmentCommand64::read_from_prefix(slice(
+                &obj,
+                le_off,
+                size_of::<SegmentCommand64>(),
+            )?)
+            .ok_or(Error::InvalidObject("Failed to read linkedit segment"))?;
+            le.filesize = le.filesize.saturating_sub(datasize);
+            obj[le_off..le_off + size_of::<SegmentCommand64>()].copy_from_slice(le.as_bytes());
+        }
+        obj.truncate(dataoff as usize);
+    }
+
+    // Remove the load command by compacting the ones after it up by `cmdsize`,
+    // then zero-filling the vacated tail. The command region keeps its physical
+    // size (the freed bytes become header slack), so every segment file offset
+    // is untouched.
+    let cmds_end = size_of::<Header64>() + header.sizeofcmds as usize;
+    // Truncating above can have moved the end of the file, and none of these
+    // offsets were trustworthy to begin with.
+    let tail = cmd_off
+        .checked_add(cmdsize)
+        .filter(|tail| *tail <= cmds_end && cmds_end <= obj.len())
+        .ok_or(Error::InvalidObject(
+            "Code signature command lies outside the load commands",
+        ))?;
+    obj.copy_within(tail..cmds_end, cmd_off);
+    obj[cmds_end - cmdsize..cmds_end].fill(0);
+    header.ncmds -= 1;
+    header.sizeofcmds = header
+        .sizeofcmds
+        .checked_sub(cmdsize as u32)
+        .ok_or(Error::InvalidObject("Load command larger than the region"))?;
+    obj[..size_of::<Header64>()].copy_from_slice(header.as_bytes());
+
+    Ok((obj, header))
+}
+
 impl Macho {
     pub fn from(obj: Vec<u8>) -> Result<Self, Error> {
         let header = Header64::read_from_prefix(&obj)
             .ok_or(Error::InvalidObject("Failed to read header"))?;
 
-        // Atomically strip code signature first for intel binaries.
-        #[cfg(target_vendor = "apple")]
-        let obj = if header.cputype != CPU_TYPE_ARM_64 {
-            use std::io::Write;
-
-            let tmp_dir = std::env::temp_dir();
-            std::fs::create_dir_all(&tmp_dir)?;
-            let tmp_path = tmp_dir.join(format!("sui_tmp_{}", std::process::id()));
-
-            let mut tmp_file = std::fs::File::create(&tmp_path)?;
-            tmp_file.write_all(&obj)?;
-            drop(tmp_file);
-
-            match std::process::Command::new("codesign")
-                .arg("--remove-signature")
-                .arg(&tmp_path)
-                .output()
-            {
-                Ok(output) => {
-                    if !output.status.success() {
-                        // If codesign fails, just use the original binary
-                        eprintln!(
-                            "Warning: Failed to remove code signature: {}",
-                            String::from_utf8_lossy(&output.stderr)
-                        );
-                        std::fs::remove_file(&tmp_path).ok();
-                        obj
-                    } else {
-                        // Read the stripped binary
-                        let stripped = std::fs::read(&tmp_path)?;
-                        std::fs::remove_file(&tmp_path).ok();
-                        stripped
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // codesign not found, skip it
-                    std::fs::remove_file(&tmp_path).ok();
-                    obj
-                }
-                Err(e) => {
-                    std::fs::remove_file(&tmp_path).ok();
-                    return Err(e.into());
-                }
-            }
+        // x86_64 input is typically ad-hoc signed by the linker. Inserting the
+        // __SUI segment invalidates that signature, and x86_64 `build()` output
+        // is expected to run unsigned, so strip it here. arm64 keeps its
+        // signature and is re-signed by `build_and_sign`.
+        let (obj, header) = if header.cputype != CPU_TYPE_ARM_64 {
+            strip_code_signature(obj)?
         } else {
-            obj
+            (obj, header)
         };
 
-        let mut commands: Vec<(u32, u32, usize)> = Vec::with_capacity(header.ncmds as usize);
+        // Not `with_capacity(ncmds)`: the count is untrusted and reserving
+        // from it turns a 4-byte edit into a huge allocation.
+        let mut commands: Vec<(u32, u32, usize)> = Vec::new();
 
         let mut offset = size_of::<Header64>();
         let mut linkedit_cmd = None;
 
         for _ in 0..header.ncmds as usize {
-            let cmd = u32::from_le_bytes(
-                obj[offset..offset + 4]
-                    .try_into()
-                    .map_err(|_| Error::InvalidObject("Failed to read command"))?,
-            );
-            let cmdsize = u32::from_le_bytes(
-                obj[offset + 4..offset + 8]
-                    .try_into()
-                    .map_err(|_| Error::InvalidObject("Failed to read command size"))?,
-            );
+            let head = slice(&obj, offset, 8)?;
+            let cmd = u32::from_le_bytes(head[..4].try_into().unwrap());
+            let cmdsize = u32::from_le_bytes(head[4..].try_into().unwrap());
+            if (cmdsize as usize) < 8 {
+                return Err(Error::InvalidObject("Load command smaller than its header"));
+            }
+            // Every later pass walks these by offset, so prove the whole
+            // command is really there before recording it.
+            slice(&obj, offset, cmdsize as usize)?;
 
             if cmd == LC_SEGMENT_64 {
-                let segcmd = SegmentCommand64::read_from_prefix(&obj[offset..])
-                    .ok_or(Error::InvalidObject("Failed to read segment command"))?;
+                let segcmd =
+                    SegmentCommand64::read_from_prefix(slice(&obj, offset, size_of::<SegmentCommand64>())?)
+                        .ok_or(Error::InvalidObject("Failed to read segment command"))?;
                 if segcmd.segname[..SEG_LINKEDIT.len()] == *SEG_LINKEDIT {
                     linkedit_cmd = Some(segcmd);
                 }
@@ -618,8 +687,17 @@ impl Macho {
         let Some(linkedit_cmd) = linkedit_cmd else {
             return Err(Error::InvalidObject("Linkedit segment not found"));
         };
-        let rest_size =
-            linkedit_cmd.fileoff - size_of::<Header64>() as u64 - header.sizeofcmds as u64;
+        let rest_size = linkedit_cmd
+            .fileoff
+            .checked_sub(size_of::<Header64>() as u64 + header.sizeofcmds as u64)
+            .ok_or(Error::InvalidObject(
+                "__LINKEDIT starts inside the load commands",
+            ))?;
+        slice(
+            &obj,
+            linkedit_cmd.fileoff as usize,
+            linkedit_cmd.filesize as usize,
+        )?;
         Ok(Self {
             header,
             commands,
@@ -632,12 +710,68 @@ impl Macho {
         })
     }
 
+    /// File offset of the first byte of real image content that follows the
+    /// load commands.
+    ///
+    /// Everything between the end of the load commands and this offset is
+    /// linker-reserved header padding (`ld -headerpad`). That padding is the
+    /// *only* place a new load command can go: load commands must be
+    /// contiguous with the header, while every section and segment is pinned
+    /// to its file offset by addresses baked into the linked image.
+    fn header_pad_limit(&self) -> Result<u64, Error> {
+        let mut limit = self.linkedit_cmd.fileoff;
+
+        for (cmd, _, offset) in &self.commands {
+            if *cmd != LC_SEGMENT_64 {
+                continue;
+            }
+            let seg = SegmentCommand64::read_from_prefix(&self.data[*offset..])
+                .ok_or(Error::InvalidObject("Failed to read segment command"))?;
+            // __TEXT starts at file offset 0 (it covers the header itself), so
+            // it never bounds the padding; its sections below do.
+            if seg.fileoff > 0 && seg.filesize > 0 {
+                limit = limit.min(seg.fileoff);
+            }
+
+            let mut sect_offset = *offset + size_of::<SegmentCommand64>();
+            for _ in 0..seg.nsects {
+                let sect = Section64::read_from_prefix(slice(
+                    &self.data,
+                    sect_offset,
+                    size_of::<Section64>(),
+                )?)
+                .ok_or(Error::InvalidObject("Failed to read section"))?;
+                // A zero offset marks a zerofill section, which takes no file space.
+                if sect.offset > 0 && sect.size > 0 {
+                    limit = limit.min(sect.offset as u64);
+                }
+                sect_offset += size_of::<Section64>();
+            }
+        }
+
+        Ok(limit)
+    }
+
     /// Write a section into the Mach-O file.
     ///
     /// `name` is the Mach-O section name. The Mach-O format stores section
     /// names in a fixed-size 16-byte field, so `name` must be at most
     /// **16 bytes** long. Names longer than 16 bytes return
     /// [`Error::InvalidObject`] instead of panicking.
+    ///
+    /// Adding the `__SUI` segment costs a `LC_SEGMENT_64` plus one section
+    /// entry in the load command region. When the input executable was linked
+    /// with less header padding than that — a stock `cargo build` binary often
+    /// has only 48 bytes — the image is first pushed down a page to make room.
+    ///
+    /// Growing the padding moves every code address, which has two visible
+    /// consequences on arm64. The output carries a new `LC_UUID`, because a
+    /// `.dSYM` built for the input no longer describes it and a debugger that
+    /// paired the two would report wrong line numbers; symbol-table
+    /// symbolication is unaffected. And images whose entry point lives in a
+    /// thread state (`LC_UNIXTHREAD`) rather than `LC_MAIN` are rejected, since
+    /// that address cannot be relocated here. Inputs with enough padding are
+    /// untouched by both.
     pub fn write_section(mut self, name: &str, sectdata: Vec<u8>) -> Result<Self, Error> {
         if name.len() > 16 {
             return Err(Error::InvalidObject(
@@ -646,12 +780,46 @@ impl Macho {
         }
 
         /* x86_64 */
+        // x86_64 appends its payload past the end of the file rather than
+        // adding a segment, so it needs no room in the load commands.
         if self.header.cputype != CPU_TYPE_ARM_64 {
             self.sectdata = Some(sectdata);
             return Ok(self);
         }
 
         /* arm64 */
+        // The new load command is carved out of the header padding, and
+        // `build` keeps every later file offset exactly where it was by
+        // dropping that many padding bytes. Writing it into padding that isn't
+        // there would silently clobber the first bytes of __TEXT, which shows
+        // up at runtime as SIGILL.
+        let pad_limit = self.header_pad_limit()?;
+        let cmds_end = size_of::<Header64>() as u64 + self.header.sizeofcmds as u64;
+        if pad_limit >= cmds_end + NEW_SEGMENT_CMDSIZE {
+            return self.write_section_in_place(name, sectdata);
+        }
+
+        let shortfall = (cmds_end + NEW_SEGMENT_CMDSIZE).saturating_sub(pad_limit);
+        let width = align(shortfall, 0x4000).max(0x4000);
+        // Growing calls the in-place writer directly rather than recursing, so
+        // a shift that somehow fell short can only error, never loop.
+        Self::from(macho_shift::shift(self.data, width)?)?
+            .write_section_in_place(name, sectdata)
+    }
+
+    /// Add the `__SUI` segment, assuming the header padding already fits it.
+    fn write_section_in_place(mut self, name: &str, sectdata: Vec<u8>) -> Result<Self, Error> {
+        let cmds_end = size_of::<Header64>() as u64 + self.header.sizeofcmds as u64;
+        if self.header_pad_limit()? < cmds_end + NEW_SEGMENT_CMDSIZE {
+            return Err(Error::InvalidObject(
+                "Failed to grow the Mach-O header padding",
+            ));
+        }
+
+        // Must run before the __LINKEDIT offsets below are shifted, while the
+        // chained fixups blob is still where its load command says it is.
+        self.widen_chained_fixups()?;
+
         let page_size = 0x10000;
 
         self.seg = SegmentCommand64 {
@@ -811,6 +979,128 @@ impl Macho {
         Ok(self)
     }
 
+    /// Keep `dyld_chained_starts_in_image` in step with the segment count.
+    ///
+    /// That structure carries one `seg_info_offset` per segment and a
+    /// `seg_count` that readers require to equal the number of segments in the
+    /// image, so inserting `__SUI` invalidates it. `dyld` itself tolerates the
+    /// mismatch — the existing fixups still resolve because the new segment is
+    /// appended past the ones that carry any — but `dyld_info` rejects such an
+    /// image outright, and relying on a loader staying lenient is not a
+    /// position worth being in.
+    ///
+    /// The array grows in place. Linkers leave the structure 4-byte aligned a
+    /// little past the 28-byte header, and the entry for `__LINKEDIT` is
+    /// always zero, so the extra slot is carved out of that gap rather than by
+    /// resizing the blob and disturbing the imports and symbols behind it.
+    fn widen_chained_fixups(&mut self) -> Result<(), Error> {
+        const FIXUPS_HEADER_SIZE: u64 = 28;
+
+        let Some(&(_, _, cmd_offset)) = self
+            .commands
+            .iter()
+            .find(|(cmd, _, _)| *cmd == LC_DYLD_CHAINED_FIXUPS)
+        else {
+            return Ok(());
+        };
+
+        let read = |data: &[u8], at: u64| -> Result<u32, Error> {
+            let at = at as usize;
+            data.get(at..at + 4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                .ok_or(Error::InvalidObject("Truncated chained fixups"))
+        };
+
+        let blob = read(&self.data, cmd_offset as u64 + 8)? as u64;
+        let blob_size = read(&self.data, cmd_offset as u64 + 12)? as u64;
+        if blob_size == 0 {
+            return Ok(());
+        }
+
+        let starts_offset = read(&self.data, blob + 4)? as u64;
+        let imports_offset = read(&self.data, blob + 8)? as u64;
+        let starts = blob + starts_offset;
+        let seg_count = read(&self.data, starts)? as u64;
+
+        // The structure is defined as one entry per segment, so anything else
+        // is malformed. Checking up front bounds the array read below: a bogus
+        // count would otherwise reserve tens of gigabytes before the first
+        // out-of-range read could fail.
+        let segment_count = self
+            .commands
+            .iter()
+            .filter(|(cmd, _, _)| *cmd == LC_SEGMENT_64)
+            .count() as u64;
+        if seg_count != segment_count {
+            return Err(Error::InvalidObject(
+                "dyld_chained_starts_in_image does not describe every segment",
+            ));
+        }
+
+        let mut offsets = Vec::new();
+        for index in 0..seg_count {
+            offsets.push(read(&self.data, starts + 4 + index * 4)? as u64);
+        }
+
+        // The array runs up to whatever comes first behind it: the earliest
+        // per-segment structure, or the imports when no segment has fixups.
+        let boundary = offsets
+            .iter()
+            .filter(|offset| **offset != 0)
+            .map(|offset| starts + offset)
+            .min()
+            .unwrap_or(blob + imports_offset);
+
+        // __SUI is written where __LINKEDIT's command used to sit, so it takes
+        // __LINKEDIT's index and pushes it one along.
+        let sui_index = self
+            .commands
+            .iter()
+            .filter(|(cmd, _, _)| *cmd == LC_SEGMENT_64)
+            .position(|(_, _, offset)| {
+                SegmentCommand64::read_from_prefix(&self.data[*offset..])
+                    .is_some_and(|seg| seg.segname[..SEG_LINKEDIT.len()] == *SEG_LINKEDIT)
+            })
+            .ok_or(Error::InvalidObject("Linkedit segment not found"))? as u64;
+
+        let new_count = seg_count + 1;
+        let new_size = 4 + new_count * 4;
+        let new_starts = boundary
+            .checked_sub(new_size)
+            .filter(|start| *start >= blob + FIXUPS_HEADER_SIZE)
+            .ok_or(Error::InvalidObject(
+                "No room to widen dyld_chained_starts_in_image",
+            ))?;
+
+        let mut rebuilt = Vec::with_capacity(new_size as usize);
+        rebuilt.extend_from_slice(&(new_count as u32).to_le_bytes());
+        for index in 0..new_count {
+            // Offsets are relative to the structure, which just moved.
+            let value = match index {
+                _ if index == sui_index => 0,
+                _ if index < sui_index => offsets[index as usize],
+                _ => offsets[index as usize - 1],
+            };
+            let moved = if value == 0 {
+                0
+            } else {
+                starts + value - new_starts
+            };
+            rebuilt.extend_from_slice(&(moved as u32).to_le_bytes());
+        }
+
+        let at = new_starts as usize;
+        self.data
+            .get_mut(at..at + rebuilt.len())
+            .ok_or(Error::InvalidObject("Truncated chained fixups"))?
+            .copy_from_slice(&rebuilt);
+        let starts_field = blob as usize + 4;
+        self.data[starts_field..starts_field + 4]
+            .copy_from_slice(&((new_starts - blob) as u32).to_le_bytes());
+
+        Ok(())
+    }
+
     /// Build and write the modified Mach-O file
     pub fn build<W: Write>(mut self, writer: &mut W) -> Result<(), Error> {
         if self.header.cputype != CPU_TYPE_ARM_64 {
@@ -850,13 +1140,15 @@ impl Macho {
                     continue;
                 }
             }
-            writer.write_all(&self.data[*offset..*offset + *cmdsize as usize])?;
+            writer.write_all(slice(&self.data, *offset, *cmdsize as usize)?)?;
         }
 
         let mut off = self.header.sizeofcmds as usize + size_of::<Header64>();
 
-        let len = self.rest_size as usize - self.seg.cmdsize as usize;
-        writer.write_all(&self.data[off..off + len])?;
+        let len = (self.rest_size as usize)
+            .checked_sub(self.seg.cmdsize as usize)
+            .ok_or(Error::InvalidObject("Not enough header padding"))?;
+        writer.write_all(slice(&self.data, off, len)?)?;
 
         off += len;
 
@@ -868,7 +1160,7 @@ impl Macho {
             }
         }
 
-        writer.write_all(&self.data[off..off + self.linkedit_cmd.filesize as usize])?;
+        writer.write_all(slice(&self.data, off, self.linkedit_cmd.filesize as usize)?)?;
 
         Ok(())
     }
@@ -1812,6 +2104,300 @@ mod tests {
             found_fvf,
             Some(fvf_dataoff + expected_shift as u32),
             "LC_FUNCTION_VARIANT_FIXUPS dataoff was not shifted"
+        );
+    }
+
+    const TEXT_FILL: u8 = 0xCC;
+    const TEXT_SIZE: usize = 64;
+    /// End of the load commands in the fixtures built by `macho_with_text_at`.
+    const CMDS_END: usize = size_of::<Header64>()
+        + size_of::<SegmentCommand64>() * 2
+        + size_of::<Section64>()
+        + SYMTAB_CMD_SIZE;
+    const SYMTAB_CMD_SIZE: usize = 24;
+    /// Header padding consumed by the `__SUI` segment plus its section entry.
+    const NEEDED_PAD: usize = size_of::<SegmentCommand64>() + size_of::<Section64>();
+
+    /// Build a minimal arm64 Mach-O whose `__TEXT` holds one section starting
+    /// at `text_fileoff`, so the header padding is `text_fileoff - cmds_end`.
+    fn macho_with_text_at(text_fileoff: usize) -> Vec<u8> {
+        const HEADER_SIZE: usize = size_of::<Header64>();
+        const SEG_SIZE: usize = size_of::<SegmentCommand64>();
+        const SECT_SIZE: usize = size_of::<Section64>();
+
+        let sizeofcmds = SEG_SIZE + SECT_SIZE + SEG_SIZE + SYMTAB_CMD_SIZE;
+        assert!(text_fileoff >= HEADER_SIZE + sizeofcmds);
+        let linkedit_fileoff = align((text_fileoff + TEXT_SIZE) as u64, 0x4000) as usize;
+        let linkedit_filesize: u64 = 32;
+
+        let header = Header64 {
+            magic: 0xfeedfacf,
+            cputype: CPU_TYPE_ARM_64,
+            cpusubtype: 0,
+            filetype: 2,
+            ncmds: 3,
+            sizeofcmds: sizeofcmds as u32,
+            flags: 0,
+            reserved: 0,
+        };
+
+        let text_seg = SegmentCommand64 {
+            cmd: LC_SEGMENT_64,
+            cmdsize: (SEG_SIZE + SECT_SIZE) as u32,
+            segname: *b"__TEXT\0\0\0\0\0\0\0\0\0\0",
+            vmaddr: 0x1_0000_0000,
+            vmsize: linkedit_fileoff as u64,
+            fileoff: 0,
+            filesize: linkedit_fileoff as u64,
+            maxprot: 5,
+            initprot: 5,
+            nsects: 1,
+            flags: 0,
+        };
+
+        let text_sect = Section64 {
+            sectname: *b"__text\0\0\0\0\0\0\0\0\0\0",
+            segname: *b"__TEXT\0\0\0\0\0\0\0\0\0\0",
+            addr: 0x1_0000_0000 + text_fileoff as u64,
+            size: TEXT_SIZE as u64,
+            offset: text_fileoff as u32,
+            align: 2,
+            reloff: 0,
+            nreloc: 0,
+            flags: 0x8000_0400,
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+        };
+
+        let linkedit_seg = SegmentCommand64 {
+            cmd: LC_SEGMENT_64,
+            cmdsize: SEG_SIZE as u32,
+            segname: *b"__LINKEDIT\0\0\0\0\0\0",
+            vmaddr: 0x1_0000_0000 + linkedit_fileoff as u64,
+            vmsize: 0x4000,
+            fileoff: linkedit_fileoff as u64,
+            filesize: linkedit_filesize,
+            maxprot: 1,
+            initprot: 1,
+            nsects: 0,
+            flags: 0,
+        };
+
+        let mut obj = Vec::new();
+        obj.extend_from_slice(header.as_bytes());
+        obj.extend_from_slice(text_seg.as_bytes());
+        obj.extend_from_slice(text_sect.as_bytes());
+        obj.extend_from_slice(linkedit_seg.as_bytes());
+        // An LC_SYMTAB claiming the whole of __LINKEDIT as its string table;
+        // growing the header pad relays the region out from its commands, so
+        // every byte in there has to belong to one.
+        obj.extend_from_slice(&LC_SYMTAB.to_le_bytes());
+        obj.extend_from_slice(&(SYMTAB_CMD_SIZE as u32).to_le_bytes());
+        obj.extend_from_slice(&0u32.to_le_bytes()); // symoff
+        obj.extend_from_slice(&0u32.to_le_bytes()); // nsyms
+        obj.extend_from_slice(&(linkedit_fileoff as u32).to_le_bytes()); // stroff
+        obj.extend_from_slice(&(linkedit_filesize as u32).to_le_bytes()); // strsize
+        obj.resize(text_fileoff, 0); // header padding
+        obj.extend_from_slice(&[TEXT_FILL; TEXT_SIZE]);
+        obj.resize(linkedit_fileoff, 0);
+        obj.extend_from_slice(&vec![0xAB; linkedit_filesize as usize]);
+        obj
+    }
+
+    /// Count `LC_SEGMENT_64` commands, and read `seg_count` out of the image's
+    /// `dyld_chained_starts_in_image`.
+    fn segment_and_fixup_counts(obj: &[u8]) -> Option<(u32, u32)> {
+        let header = Header64::read_from_prefix(obj)?;
+        let mut offset = size_of::<Header64>();
+        let mut segments = 0u32;
+        let mut seg_count = None;
+
+        for _ in 0..header.ncmds {
+            let cmd = u32::from_le_bytes(obj[offset..offset + 4].try_into().unwrap());
+            let cmdsize = u32::from_le_bytes(obj[offset + 4..offset + 8].try_into().unwrap());
+            if cmd == LC_SEGMENT_64 {
+                segments += 1;
+            }
+            if cmd == LC_DYLD_CHAINED_FIXUPS {
+                let blob =
+                    u32::from_le_bytes(obj[offset + 8..offset + 12].try_into().unwrap()) as usize;
+                let starts =
+                    blob + u32::from_le_bytes(obj[blob + 4..blob + 8].try_into().unwrap()) as usize;
+                seg_count =
+                    Some(u32::from_le_bytes(obj[starts..starts + 4].try_into().unwrap()));
+            }
+            offset += cmdsize as usize;
+        }
+        seg_count.map(|count| (segments, count))
+    }
+
+    // Chained fixups record one `seg_info_offset` per segment alongside a
+    // `seg_count`, and readers require the two to agree. Adding __SUI used to
+    // leave the original count in place, which `dyld_info` rejects outright —
+    // on every binary libsui touched, shifted or not.
+    #[test]
+    fn chained_fixups_seg_count_follows_the_new_segment() {
+        let fixture = &include_bytes!("tests/exec_mach64_chained")[..];
+
+        let (segments, seg_count) =
+            segment_and_fixup_counts(fixture).expect("fixture should use chained fixups");
+        assert_eq!(segments, seg_count, "fixture is malformed to begin with");
+
+        let mut out = Vec::new();
+        Macho::from(fixture.to_vec())
+            .unwrap()
+            .write_section("__sui", vec![0u8; 32])
+            .unwrap()
+            .build(&mut out)
+            .unwrap();
+
+        let (segments, seg_count) = segment_and_fixup_counts(&out).unwrap();
+        assert_eq!(segments, seg_count, "seg_count did not follow __SUI");
+    }
+
+    // A `seg_count` that disagrees with the load commands used to index past
+    // the end of the offsets array. Found by fuzzing.
+    #[test]
+    fn short_chained_fixups_seg_count_is_rejected() {
+        let mut obj = include_bytes!("tests/exec_mach64_chained").to_vec();
+
+        // Walk to LC_DYLD_CHAINED_FIXUPS and shrink the count it declares.
+        let header = Header64::read_from_prefix(&obj[..]).unwrap();
+        let mut offset = size_of::<Header64>();
+        let mut starts = None;
+        for _ in 0..header.ncmds {
+            let cmd = u32::from_le_bytes(obj[offset..offset + 4].try_into().unwrap());
+            let cmdsize = u32::from_le_bytes(obj[offset + 4..offset + 8].try_into().unwrap());
+            if cmd == LC_DYLD_CHAINED_FIXUPS {
+                let blob =
+                    u32::from_le_bytes(obj[offset + 8..offset + 12].try_into().unwrap()) as usize;
+                starts = Some(
+                    blob + u32::from_le_bytes(obj[blob + 4..blob + 8].try_into().unwrap()) as usize,
+                );
+            }
+            offset += cmdsize as usize;
+        }
+        let starts = starts.expect("fixture should use chained fixups");
+        obj[starts..starts + 4].copy_from_slice(&1u32.to_le_bytes());
+
+        match Macho::from(obj).unwrap().write_section("__sui", vec![0u8; 16]) {
+            Err(Error::InvalidObject(_)) => {}
+            Err(other) => panic!("unexpected error: {other:?}"),
+            Ok(_) => panic!("a short seg_count was accepted"),
+        }
+    }
+
+    // The whole public path, not just the shift: a malformed image must be
+    // rejected rather than panic anywhere between parsing and writing.
+    #[test]
+    fn corrupt_input_never_panics_through_the_public_api() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        for fixture in [
+            &include_bytes!("tests/exec_mach64")[..],
+            &include_bytes!("tests/exec_mach64_chained")[..],
+        ] {
+            for _ in 0..1500 {
+                let mut obj = fixture.to_vec();
+                for _ in 0..1 + next() % 6 {
+                    let at = (next() as usize) % obj.len().min(4096);
+                    obj[at] = next() as u8;
+                }
+                if let Ok(macho) = Macho::from(obj) {
+                    if let Ok(macho) = macho.write_section("__sui", vec![0u8; 16]) {
+                        let mut out = Vec::new();
+                        let _ = macho.build(&mut out);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Find a segment's `(fileoff, filesize)` in a built image.
+    fn find_segment(obj: &[u8], name: &[u8]) -> Option<(u64, u64)> {
+        let header = Header64::read_from_prefix(obj)?;
+        let mut offset = size_of::<Header64>();
+        for _ in 0..header.ncmds {
+            let cmd = u32::from_le_bytes(obj[offset..offset + 4].try_into().unwrap());
+            let cmdsize = u32::from_le_bytes(obj[offset + 4..offset + 8].try_into().unwrap());
+            if cmd == LC_SEGMENT_64 {
+                let seg = SegmentCommand64::read_from_prefix(&obj[offset..])?;
+                if seg.segname[..name.len()] == *name {
+                    return Some((seg.fileoff, seg.filesize));
+                }
+            }
+            offset += cmdsize as usize;
+        }
+        None
+    }
+
+    // Regression test for denoland/sui#82. A binary linked with a header pad
+    // too small for the new LC_SEGMENT_64 + section used to be accepted, and
+    // `build` then overwrote the first bytes of __TEXT with load command bytes
+    // (SIGILL at runtime). The image must be pushed down far enough to fit the
+    // command instead, carrying __TEXT with it intact.
+    #[test]
+    fn grows_header_padding_when_too_small() {
+        // 48 bytes is what a stock `cargo build` binary had in the report.
+        for pad in [0, 48, NEEDED_PAD - 1] {
+            let text_fileoff = CMDS_END + pad;
+            let obj = macho_with_text_at(text_fileoff);
+
+            let mut out = Vec::new();
+            Macho::from(obj)
+                .unwrap()
+                .write_section("__sui", vec![0u8; 16])
+                .unwrap()
+                .build(&mut out)
+                .unwrap();
+
+            let header = Header64::read_from_prefix(&out[..]).unwrap();
+            let cmds_end = size_of::<Header64>() + header.sizeofcmds as usize;
+            assert!(
+                cmds_end + NEEDED_PAD <= text_fileoff + 0x4000,
+                "{pad}-byte pad: load commands still overrun __TEXT"
+            );
+
+            // __TEXT moved down by exactly the page that was inserted, and its
+            // contents came along untouched.
+            let moved = text_fileoff + 0x4000;
+            assert_eq!(
+                &out[moved..moved + TEXT_SIZE],
+                &[TEXT_FILL; TEXT_SIZE],
+                "{pad}-byte pad: __TEXT was clobbered"
+            );
+
+            let (sui_off, sui_size) =
+                find_segment(&out, b"__SUI\0").expect("__SUI segment missing");
+            assert!(sui_size > 0 && sui_off > 0, "{pad}-byte pad: empty __SUI");
+        }
+    }
+
+    // The complement: with room to spare nothing moves at all.
+    #[test]
+    fn preserves_text_when_header_padding_suffices() {
+        let text_fileoff = CMDS_END + NEEDED_PAD;
+
+        let obj = macho_with_text_at(text_fileoff);
+        let mut out = Vec::new();
+        Macho::from(obj)
+            .unwrap()
+            .write_section("__sui", vec![0u8; 16])
+            .unwrap()
+            .build(&mut out)
+            .unwrap();
+
+        assert_eq!(
+            &out[text_fileoff..text_fileoff + TEXT_SIZE],
+            &[TEXT_FILL; TEXT_SIZE],
+            "__TEXT contents moved or were clobbered"
         );
     }
 }

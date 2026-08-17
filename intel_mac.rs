@@ -104,19 +104,18 @@ pub fn find_section_in_file(path: &std::path::Path) -> std::io::Result<Option<&'
     for &byte in reversed.iter().rev() {
         sentinel.push(byte);
     }
-    // Add magic bytes in reverse order with black_box
     let magic = std::hint::black_box([0xEF, 0xBE, 0xAD, 0xDE]);
     sentinel.extend_from_slice(&magic);
     let sentinel = sentinel.as_slice();
 
     let mut file = std::fs::File::open(path)?;
 
-    // Get file size
     let file_size = file.seek(SeekFrom::End(0))?;
 
     // Search backwards for sentinel in chunks to avoid allocating huge buffer
-    const CHUNK_SIZE: usize = 1024 * 1024; // 1MB chunks
-    let overlap = sentinel.len() + 8; // Overlap to handle sentinel across chunk boundaries
+    const CHUNK_SIZE: usize = 1024 * 1024;
+    // Enough overlap that a sentinel straddling two chunks is still found.
+    let overlap = sentinel.len() + 8;
 
     let mut pos = file_size;
     let mut prev_chunk_tail = vec![0u8; 0];
@@ -129,13 +128,11 @@ pub fn find_section_in_file(path: &std::path::Path) -> std::io::Result<Option<&'
         let mut chunk = vec![0u8; chunk_len];
         file.read_exact(&mut chunk)?;
 
-        // Append previous chunk tail for overlap handling
         chunk.extend_from_slice(&prev_chunk_tail);
 
-        // Find sentinel from the end of this chunk
         for i in (0..=(chunk.len().saturating_sub(sentinel.len()))).rev() {
             if &chunk[i..i + sentinel.len()] == sentinel {
-                // Found sentinel, read data length (u64 after sentinel)
+                // The payload length is a u64 immediately after the sentinel.
                 if i + sentinel.len() + 8 > chunk.len() {
                     return Ok(None);
                 }
@@ -147,12 +144,11 @@ pub fn find_section_in_file(path: &std::path::Path) -> std::io::Result<Option<&'
                     })?;
                 let data_len = u64::from_le_bytes(len_bytes) as usize;
 
-                // Read the actual data
                 let data_start = i + sentinel.len() + 8;
                 if data_start + data_len > chunk.len() {
                     // We need to read the rest of the data from the file
-                    let mut data = chunk[data_start..].to_vec(); // data we already have
-                    let remaining = data_len - (chunk.len() - data_start); // how much we need to read
+                    let mut data = chunk[data_start..].to_vec();
+                    let remaining = data_len - (chunk.len() - data_start);
                     file.seek(SeekFrom::Start(chunk_start + chunk.len() as u64))?;
                     if chunk.len() < remaining {
                         chunk.extend(std::iter::repeat_n(0, remaining - chunk.len()));
@@ -166,7 +162,6 @@ pub fn find_section_in_file(path: &std::path::Path) -> std::io::Result<Option<&'
             }
         }
 
-        // Save tail of current chunk for next iteration (for overlap)
         prev_chunk_tail = if chunk_len > overlap {
             chunk[..overlap].to_vec()
         } else {
@@ -179,20 +174,10 @@ pub fn find_section_in_file(path: &std::path::Path) -> std::io::Result<Option<&'
     Ok(None)
 }
 
-/// Patch a Mach-O executable file
+/// Fix up the `__LINKEDIT` segment sizes and the symbol table string size
+/// after data has been appended past the sections.
 ///
-/// This function modifies the Mach-O header to fix up segment and symbol table sizes.
-/// It specifically patches:
-/// - The __LINKEDIT segment's vmsize and filesize
-/// - The symbol table's string size
-///
-/// # Arguments
-///
-/// * `file` - A mutable reference to the Mach-O executable bytes
-///
-/// # Returns
-///
-/// Returns `true` if patching was successful, `false` otherwise
+/// Returns false if the image is malformed.
 pub fn patch_macho_executable(file: &mut [u8]) -> bool {
     const ALIGN: usize = 8;
     const HSIZE: usize = 32;
@@ -228,8 +213,6 @@ pub fn patch_macho_executable(file: &mut [u8]) -> bool {
             return false;
         }
 
-        // Split the file slice to allow mutable access to the command buffer
-        // while keeping file_len available
         let (_, rest) = file.split_at_mut(offset);
         let cmd_buf = &mut rest[..size];
         patch_command(cmd_type, cmd_buf, file_len);
@@ -282,7 +265,7 @@ mod tests {
     #[test]
     fn test_patch_macho_executable_invalid() {
         let mut buf = vec![0u8; 10];
-        assert_eq!(patch_macho_executable(&mut buf), false);
+        assert!(!patch_macho_executable(&mut buf));
     }
 
     #[test]
@@ -297,6 +280,6 @@ mod tests {
         write_u32_le(&mut buf, 32, 0x19);
         write_u32_le(&mut buf, 36, 4);
         // Must reject the malformed command rather than underflowing.
-        assert_eq!(patch_macho_executable(&mut buf), false);
+        assert!(!patch_macho_executable(&mut buf));
     }
 }
