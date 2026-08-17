@@ -695,6 +695,10 @@ impl Macho {
         }
 
         /* arm64 */
+        // Must run before the __LINKEDIT offsets below are shifted, while the
+        // chained fixups blob is still where its load command says it is.
+        self.widen_chained_fixups()?;
+
         let page_size = 0x10000;
 
         self.seg = SegmentCommand64 {
@@ -852,6 +856,113 @@ impl Macho {
 
         self.sectdata = Some(sectdata);
         Ok(self)
+    }
+
+    /// Keep `dyld_chained_starts_in_image` in step with the segment count.
+    ///
+    /// That structure carries one `seg_info_offset` per segment and a
+    /// `seg_count` that readers require to equal the number of segments in the
+    /// image, so inserting `__SUI` invalidates it. `dyld` itself tolerates the
+    /// mismatch — the existing fixups still resolve because the new segment is
+    /// appended past the ones that carry any — but `dyld_info` rejects such an
+    /// image outright, and relying on a loader staying lenient is not a
+    /// position worth being in.
+    ///
+    /// The array grows in place. Linkers leave the structure 4-byte aligned a
+    /// little past the 28-byte header, and the entry for `__LINKEDIT` is
+    /// always zero, so the extra slot is carved out of that gap rather than by
+    /// resizing the blob and disturbing the imports and symbols behind it.
+    fn widen_chained_fixups(&mut self) -> Result<(), Error> {
+        const FIXUPS_HEADER_SIZE: u64 = 28;
+
+        let Some(&(_, _, cmd_offset)) = self
+            .commands
+            .iter()
+            .find(|(cmd, _, _)| *cmd == LC_DYLD_CHAINED_FIXUPS)
+        else {
+            return Ok(());
+        };
+
+        let read = |data: &[u8], at: u64| -> Result<u32, Error> {
+            let at = at as usize;
+            data.get(at..at + 4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                .ok_or(Error::InvalidObject("Truncated chained fixups"))
+        };
+
+        let blob = read(&self.data, cmd_offset as u64 + 8)? as u64;
+        let blob_size = read(&self.data, cmd_offset as u64 + 12)? as u64;
+        if blob_size == 0 {
+            return Ok(());
+        }
+
+        let starts_offset = read(&self.data, blob + 4)? as u64;
+        let imports_offset = read(&self.data, blob + 8)? as u64;
+        let starts = blob + starts_offset;
+        let seg_count = read(&self.data, starts)? as u64;
+
+        let mut offsets = Vec::with_capacity(seg_count as usize);
+        for index in 0..seg_count {
+            offsets.push(read(&self.data, starts + 4 + index * 4)? as u64);
+        }
+
+        // The array runs up to whatever comes first behind it: the earliest
+        // per-segment structure, or the imports when no segment has fixups.
+        let boundary = offsets
+            .iter()
+            .filter(|offset| **offset != 0)
+            .map(|offset| starts + offset)
+            .min()
+            .unwrap_or(blob + imports_offset);
+
+        // __SUI is written where __LINKEDIT's command used to sit, so it takes
+        // __LINKEDIT's index and pushes it one along.
+        let sui_index = self
+            .commands
+            .iter()
+            .filter(|(cmd, _, _)| *cmd == LC_SEGMENT_64)
+            .position(|(_, _, offset)| {
+                SegmentCommand64::read_from_prefix(&self.data[*offset..])
+                    .is_some_and(|seg| seg.segname[..SEG_LINKEDIT.len()] == *SEG_LINKEDIT)
+            })
+            .ok_or(Error::InvalidObject("Linkedit segment not found"))? as u64;
+
+        let new_count = seg_count + 1;
+        let new_size = 4 + new_count * 4;
+        let new_starts = boundary
+            .checked_sub(new_size)
+            .filter(|start| *start >= blob + FIXUPS_HEADER_SIZE)
+            .ok_or(Error::InvalidObject(
+                "No room to widen dyld_chained_starts_in_image",
+            ))?;
+
+        let mut rebuilt = Vec::with_capacity(new_size as usize);
+        rebuilt.extend_from_slice(&(new_count as u32).to_le_bytes());
+        for index in 0..new_count {
+            // Offsets are relative to the structure, which just moved.
+            let value = match index {
+                _ if index == sui_index => 0,
+                _ if index < sui_index => offsets[index as usize],
+                _ => offsets[index as usize - 1],
+            };
+            let moved = if value == 0 {
+                0
+            } else {
+                starts + value - new_starts
+            };
+            rebuilt.extend_from_slice(&(moved as u32).to_le_bytes());
+        }
+
+        let at = new_starts as usize;
+        self.data
+            .get_mut(at..at + rebuilt.len())
+            .ok_or(Error::InvalidObject("Truncated chained fixups"))?
+            .copy_from_slice(&rebuilt);
+        let starts_field = blob as usize + 4;
+        self.data[starts_field..starts_field + 4]
+            .copy_from_slice(&((new_starts - blob) as u32).to_le_bytes());
+
+        Ok(())
     }
 
     /// Build and write the modified Mach-O file
@@ -1857,4 +1968,56 @@ mod tests {
             "LC_FUNCTION_VARIANT_FIXUPS dataoff was not shifted"
         );
     }
+
+    /// Count `LC_SEGMENT_64` commands, and read `seg_count` out of the image's
+    /// `dyld_chained_starts_in_image`.
+    fn segment_and_fixup_counts(obj: &[u8]) -> Option<(u32, u32)> {
+        let header = Header64::read_from_prefix(obj)?;
+        let mut offset = size_of::<Header64>();
+        let mut segments = 0u32;
+        let mut seg_count = None;
+
+        for _ in 0..header.ncmds {
+            let cmd = u32::from_le_bytes(obj[offset..offset + 4].try_into().unwrap());
+            let cmdsize = u32::from_le_bytes(obj[offset + 4..offset + 8].try_into().unwrap());
+            if cmd == LC_SEGMENT_64 {
+                segments += 1;
+            }
+            if cmd == LC_DYLD_CHAINED_FIXUPS {
+                let blob =
+                    u32::from_le_bytes(obj[offset + 8..offset + 12].try_into().unwrap()) as usize;
+                let starts =
+                    blob + u32::from_le_bytes(obj[blob + 4..blob + 8].try_into().unwrap()) as usize;
+                seg_count =
+                    Some(u32::from_le_bytes(obj[starts..starts + 4].try_into().unwrap()));
+            }
+            offset += cmdsize as usize;
+        }
+        seg_count.map(|count| (segments, count))
+    }
+
+    // Chained fixups record one `seg_info_offset` per segment alongside a
+    // `seg_count`, and readers require the two to agree. Adding __SUI used to
+    // leave the original count in place, which `dyld_info` rejects outright —
+    // on every binary libsui touched, shifted or not.
+    #[test]
+    fn chained_fixups_seg_count_follows_the_new_segment() {
+        let fixture = &include_bytes!("tests/exec_mach64_chained")[..];
+
+        let (segments, seg_count) =
+            segment_and_fixup_counts(fixture).expect("fixture should use chained fixups");
+        assert_eq!(segments, seg_count, "fixture is malformed to begin with");
+
+        let mut out = Vec::new();
+        Macho::from(fixture.to_vec())
+            .unwrap()
+            .write_section("__sui", vec![0u8; 32])
+            .unwrap()
+            .build(&mut out)
+            .unwrap();
+
+        let (segments, seg_count) = segment_and_fixup_counts(&out).unwrap();
+        assert_eq!(segments, seg_count, "seg_count did not follow __SUI");
+    }
+
 }
