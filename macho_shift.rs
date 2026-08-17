@@ -27,6 +27,9 @@ use core::mem::size_of;
 use zerocopy::{AsBytes, FromBytes};
 
 const LC_MAIN: u32 = 0x8000_0028;
+const LC_THREAD: u32 = 0x4;
+const LC_UNIXTHREAD: u32 = 0x5;
+const LC_ROUTINES_64: u32 = 0x1a;
 const LC_UUID: u32 = 0x1b;
 const LC_SEGMENT_SPLIT_INFO: u32 = 0x1e;
 const LC_ENCRYPTION_INFO_64: u32 = 0x2c;
@@ -436,6 +439,17 @@ impl Shifter {
                     *offset,
                     "Cannot grow the load commands: LC_FUNCTION_VARIANTS has data",
                 )?,
+                LC_UNIXTHREAD | LC_THREAD | LC_ROUTINES_64 => {
+                    // These carry an absolute entry point or initialiser
+                    // address — the thread state's PC, or init_address — which
+                    // moves with the code but lives in a flavour-specific
+                    // register slot this module does not decode. Modern
+                    // linkers emit LC_MAIN instead, which is handled. Refuse
+                    // rather than hand back an image that jumps to the gap.
+                    return Err(invalid(
+                        "Cannot grow the load commands: thread-state entry point",
+                    ));
+                }
                 LC_DYSYMTAB => {
                     // Linked images leave these empty. Anything else would
                     // need its own relayout, so bail out rather than guess.
@@ -1513,6 +1527,9 @@ fn emit_trie(nodes: &[TrieNode]) -> Result<Vec<u8>, Error> {
     let mut offsets = vec![0usize; nodes.len()];
     let mut sizes: Vec<usize> = nodes.iter().map(|n| trie_node_size(n, &offsets)).collect();
 
+    // The relaxation converges monotonically — offsets only grow, so ULEB
+    // widths only grow — and a real trie settles in a handful of passes. The
+    // bound is a stop for pathological input, not a correctness limit.
     for _ in 0..32 {
         let mut cursor = 0;
         for index in 0..nodes.len() {
@@ -1581,11 +1598,12 @@ mod tests {
 
             // Retyping a command now and then steers the sweep into walkers
             // the fixture would not otherwise reach.
-            const RETYPE: [u32; 4] = [
+            const RETYPE: [u32; 5] = [
                 LC_DYLD_CHAINED_FIXUPS,
                 LC_DYLD_EXPORTS_TRIE,
                 LC_FUNCTION_STARTS,
                 LC_DATA_IN_CODE,
+                LC_UNIXTHREAD,
             ];
 
             let mut errors = 0;
@@ -1641,6 +1659,38 @@ mod tests {
                 shifted[lc_end..lc_end + 0x4000].iter().all(|b| *b == 0),
                 "the freed header padding should be zeroed"
             );
+        }
+    }
+
+    /// An entry point held in a thread state is an absolute address this
+    /// module does not decode, so such an image must be refused outright
+    /// rather than shifted into one that jumps at the inserted gap.
+    #[test]
+    fn thread_state_entry_point_is_rejected() {
+        for original in [CLASSIC, CHAINED] {
+            let mut obj = original.to_vec();
+
+            let header = Header64::read_from_prefix(&obj[..]).unwrap();
+            let mut offset = size_of::<Header64>();
+            let mut retyped = false;
+            for _ in 0..header.ncmds {
+                let cmd = read_u32(&obj, offset).unwrap();
+                let cmdsize = read_u32(&obj, offset + 4).unwrap() as usize;
+                if cmd == LC_MAIN {
+                    obj[offset..offset + 4].copy_from_slice(&LC_UNIXTHREAD.to_le_bytes());
+                    retyped = true;
+                }
+                offset += cmdsize;
+            }
+            assert!(retyped, "fixture should carry an LC_MAIN to retype");
+
+            match shift(obj, 0x4000) {
+                Err(Error::InvalidObject(msg)) => {
+                    assert!(msg.contains("thread-state"), "unexpected message: {msg}")
+                }
+                Err(other) => panic!("unexpected error: {other:?}"),
+                Ok(_) => panic!("a thread-state entry point was accepted"),
+            }
         }
     }
 

@@ -555,7 +555,10 @@ const NEW_SEGMENT_CMDSIZE: u64 =
 /// is, by construction of every linker and `codesign`, the last bytes of both
 /// `__LINKEDIT` and the file; when that does not hold the load command is still
 /// removed (so the kernel does not validate it) and the now-orphaned blob is
-/// left in place as harmless dead space.
+/// left in place as dead space. That is harmless when the `__SUI` segment fits
+/// in the existing header padding, but growing the padding relays `__LINKEDIT`
+/// out from its load commands, and an orphaned blob no command describes is
+/// rejected there rather than silently dropped.
 fn strip_code_signature(mut obj: Vec<u8>) -> Result<(Vec<u8>, Header64), Error> {
     let mut header = Header64::read_from_prefix(&obj)
         .ok_or(Error::InvalidObject("Failed to read header"))?;
@@ -760,6 +763,15 @@ impl Macho {
     /// entry in the load command region. When the input executable was linked
     /// with less header padding than that — a stock `cargo build` binary often
     /// has only 48 bytes — the image is first pushed down a page to make room.
+    ///
+    /// Growing the padding moves every code address, which has two visible
+    /// consequences on arm64. The output carries a new `LC_UUID`, because a
+    /// `.dSYM` built for the input no longer describes it and a debugger that
+    /// paired the two would report wrong line numbers; symbol-table
+    /// symbolication is unaffected. And images whose entry point lives in a
+    /// thread state (`LC_UNIXTHREAD`) rather than `LC_MAIN` are rejected, since
+    /// that address cannot be relocated here. Inputs with enough padding are
+    /// untouched by both.
     pub fn write_section(mut self, name: &str, sectdata: Vec<u8>) -> Result<Self, Error> {
         if name.len() > 16 {
             return Err(Error::InvalidObject(
