@@ -81,6 +81,7 @@ use zerocopy::{AsBytes, FromBytes, FromZeroes};
 pub mod apple_codesign;
 pub mod intel_mac;
 mod macho_shift;
+use macho_shift::slice;
 
 // libsui's own minimal PE resource writer, reduced from the BSD-2-Clause
 // `editpe` crate. See pe_edit.rs and LICENSE-editpe.
@@ -643,20 +644,20 @@ impl Macho {
         let mut linkedit_cmd = None;
 
         for _ in 0..header.ncmds as usize {
-            let cmd = u32::from_le_bytes(
-                obj[offset..offset + 4]
-                    .try_into()
-                    .map_err(|_| Error::InvalidObject("Failed to read command"))?,
-            );
-            let cmdsize = u32::from_le_bytes(
-                obj[offset + 4..offset + 8]
-                    .try_into()
-                    .map_err(|_| Error::InvalidObject("Failed to read command size"))?,
-            );
+            let head = slice(&obj, offset, 8)?;
+            let cmd = u32::from_le_bytes(head[..4].try_into().unwrap());
+            let cmdsize = u32::from_le_bytes(head[4..].try_into().unwrap());
+            if (cmdsize as usize) < 8 {
+                return Err(Error::InvalidObject("Load command smaller than its header"));
+            }
+            // Every later pass walks these by offset, so prove the whole
+            // command is really there before recording it.
+            slice(&obj, offset, cmdsize as usize)?;
 
             if cmd == LC_SEGMENT_64 {
-                let segcmd = SegmentCommand64::read_from_prefix(&obj[offset..])
-                    .ok_or(Error::InvalidObject("Failed to read segment command"))?;
+                let segcmd =
+                    SegmentCommand64::read_from_prefix(slice(&obj, offset, size_of::<SegmentCommand64>())?)
+                        .ok_or(Error::InvalidObject("Failed to read segment command"))?;
                 if segcmd.segname[..SEG_LINKEDIT.len()] == *SEG_LINKEDIT {
                     linkedit_cmd = Some(segcmd);
                 }
@@ -669,8 +670,17 @@ impl Macho {
         let Some(linkedit_cmd) = linkedit_cmd else {
             return Err(Error::InvalidObject("Linkedit segment not found"));
         };
-        let rest_size =
-            linkedit_cmd.fileoff - size_of::<Header64>() as u64 - header.sizeofcmds as u64;
+        let rest_size = linkedit_cmd
+            .fileoff
+            .checked_sub(size_of::<Header64>() as u64 + header.sizeofcmds as u64)
+            .ok_or(Error::InvalidObject(
+                "__LINKEDIT starts inside the load commands",
+            ))?;
+        slice(
+            &obj,
+            linkedit_cmd.fileoff as usize,
+            linkedit_cmd.filesize as usize,
+        )?;
         Ok(Self {
             header,
             commands,
@@ -708,8 +718,12 @@ impl Macho {
 
             let mut sect_offset = *offset + size_of::<SegmentCommand64>();
             for _ in 0..seg.nsects {
-                let sect = Section64::read_from_prefix(&self.data[sect_offset..])
-                    .ok_or(Error::InvalidObject("Failed to read section"))?;
+                let sect = Section64::read_from_prefix(slice(
+                    &self.data,
+                    sect_offset,
+                    size_of::<Section64>(),
+                )?)
+                .ok_or(Error::InvalidObject("Failed to read section"))?;
                 // A zero offset marks a zerofill section, which takes no file space.
                 if sect.offset > 0 && sect.size > 0 {
                     limit = limit.min(sect.offset as u64);
@@ -1085,13 +1099,15 @@ impl Macho {
                     continue;
                 }
             }
-            writer.write_all(&self.data[*offset..*offset + *cmdsize as usize])?;
+            writer.write_all(slice(&self.data, *offset, *cmdsize as usize)?)?;
         }
 
         let mut off = self.header.sizeofcmds as usize + size_of::<Header64>();
 
-        let len = self.rest_size as usize - self.seg.cmdsize as usize;
-        writer.write_all(&self.data[off..off + len])?;
+        let len = (self.rest_size as usize)
+            .checked_sub(self.seg.cmdsize as usize)
+            .ok_or(Error::InvalidObject("Not enough header padding"))?;
+        writer.write_all(slice(&self.data, off, len)?)?;
 
         off += len;
 
@@ -1103,7 +1119,7 @@ impl Macho {
             }
         }
 
-        writer.write_all(&self.data[off..off + self.linkedit_cmd.filesize as usize])?;
+        writer.write_all(slice(&self.data, off, self.linkedit_cmd.filesize as usize)?)?;
 
         Ok(())
     }
@@ -2197,6 +2213,38 @@ mod tests {
 
         let (segments, seg_count) = segment_and_fixup_counts(&out).unwrap();
         assert_eq!(segments, seg_count, "seg_count did not follow __SUI");
+    }
+
+    // The whole public path, not just the shift: a malformed image must be
+    // rejected rather than panic anywhere between parsing and writing.
+    #[test]
+    fn corrupt_input_never_panics_through_the_public_api() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        for fixture in [
+            &include_bytes!("tests/exec_mach64")[..],
+            &include_bytes!("tests/exec_mach64_chained")[..],
+        ] {
+            for _ in 0..1500 {
+                let mut obj = fixture.to_vec();
+                for _ in 0..1 + next() % 6 {
+                    let at = (next() as usize) % obj.len().min(4096);
+                    obj[at] = next() as u8;
+                }
+                if let Ok(macho) = Macho::from(obj) {
+                    if let Ok(macho) = macho.write_section("__sui", vec![0u8; 16]) {
+                        let mut out = Vec::new();
+                        let _ = macho.build(&mut out);
+                    }
+                }
+            }
+        }
     }
 
     /// Find a segment's `(fileoff, filesize)` in a built image.

@@ -56,7 +56,7 @@ fn invalid(msg: &'static str) -> Error {
 /// Borrow `len` bytes at `at`, or fail. Every read in this module goes
 /// through here or its callers: a shift runs over attacker-shaped input from
 /// `Macho::from`, so a malformed image has to be an error, never a panic.
-fn slice(data: &[u8], at: usize, len: usize) -> Result<&[u8], Error> {
+pub(crate) fn slice(data: &[u8], at: usize, len: usize) -> Result<&[u8], Error> {
     at.checked_add(len)
         .and_then(|end| data.get(at..end))
         .ok_or_else(|| invalid("Truncated Mach-O"))
