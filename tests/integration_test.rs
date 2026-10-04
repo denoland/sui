@@ -155,7 +155,8 @@ fn test_elf(size: usize) {
 
     elf.append(RESOURCE_NAME, &data, &mut out).unwrap();
 
-    #[cfg(all(unix, not(target_vendor = "apple"), target_arch = "x86_64"))]
+    // tests/exec_elf64 is a Linux executable.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
         drop(out);
         // Run the output
@@ -273,13 +274,17 @@ fn test_elf_note_survives_eu_strip() {
     });
     assert!(!all_zero, "eu-strip zero-filled the program header table");
 
-    // ...and the stripped binary still runs.
-    let status = std::process::Command::new(&path).status().unwrap();
-    assert!(
-        status.success(),
-        "stripped binary failed to run: {}",
-        status
-    );
+    // ...and the stripped binary still runs (tests/exec_elf64 is a Linux
+    // executable).
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::process::Command::new(&path).status().unwrap();
+        assert!(
+            status.success(),
+            "stripped binary failed to run: {}",
+            status
+        );
+    }
 }
 
 #[cfg(all(unix, not(target_vendor = "apple")))]
@@ -817,6 +822,123 @@ fn test_elf_append_phdr_reachable_via_at_phdr() {
         pt_phdr_vaddr,
         "AT_PHDR = load_bias + first_load_bias + e_phoff would miss the program header table",
     );
+}
+
+const ELFOSABI_FREEBSD: u8 = 9;
+const PT_INTERP: u32 = 3;
+
+/// Returns tests/exec_elf64 branded as a FreeBSD binary.
+fn freebsd_exec_elf64() -> Vec<u8> {
+    let mut input = std::fs::read("tests/exec_elf64").unwrap();
+    input[7] = ELFOSABI_FREEBSD;
+    input
+}
+
+/// The FreeBSD kernel refuses to execute binaries whose program headers are
+/// not within the first page (sys/kern/imgact_elf.c), so for FreeBSD
+/// executables `append` must leave the program header table in place and
+/// store the note in a non-allocated section instead.
+#[test]
+fn test_elf_append_freebsd_executable_keeps_phdrs() {
+    let input = freebsd_exec_elf64();
+    let payload = b"hello-freebsd".to_vec();
+    let mut out = Vec::new();
+    Elf::new(&input)
+        .append(RESOURCE_NAME, &payload, &mut out)
+        .unwrap();
+
+    let r16 = |b: &[u8]| u16::from_le_bytes(b[..2].try_into().unwrap());
+    let r32 = |b: &[u8]| u32::from_le_bytes(b[..4].try_into().unwrap());
+    let r64 = |b: &[u8]| u64::from_le_bytes(b[..8].try_into().unwrap());
+
+    // The program header table is untouched and still within the first page.
+    assert_eq!(&out[0x20..0x28], &input[0x20..0x28], "e_phoff changed");
+    assert_eq!(&out[0x38..0x3a], &input[0x38..0x3a], "e_phnum changed");
+    let e_phoff = r64(&out[0x20..0x28]) as usize;
+    let e_phnum = r16(&out[0x38..0x3a]) as usize;
+    assert!(e_phoff + e_phnum * r16(&out[0x36..0x38]) as usize <= 4096);
+
+    // Apart from e_shoff/e_shnum, the original bytes are preserved verbatim.
+    let mut expected = input.clone();
+    expected[0x28..0x30].copy_from_slice(&out[0x28..0x30]);
+    expected[0x3c..0x3e].copy_from_slice(&out[0x3c..0x3e]);
+    assert_eq!(&out[..input.len()], &expected[..], "original bytes mutated");
+
+    // One section was added: a non-allocated SHT_NOTE holding the SUI note.
+    let e_shoff = r64(&out[0x28..0x30]) as usize;
+    let e_shentsize = r16(&out[0x3a..0x3c]) as usize;
+    let e_shnum = r16(&out[0x3c..0x3e]) as usize;
+    assert_eq!(e_shnum, r16(&input[0x3c..0x3e]) as usize + 1);
+    let sh = &out[e_shoff + (e_shnum - 1) * e_shentsize..];
+    assert_eq!(r32(&sh[4..8]), 7, "not SHT_NOTE");
+    assert_eq!(r64(&sh[8..16]) & 2, 0, "note section is SHF_ALLOC");
+    let off = r64(&sh[24..32]) as usize;
+    let size = r64(&sh[32..40]) as usize;
+    let note = &out[off..off + size];
+
+    let namesz = r32(&note[0..4]) as usize;
+    let descsz = r32(&note[4..8]) as usize;
+    assert_eq!(r32(&note[8..12]), 0x5355_4901, "unexpected note type");
+    assert_eq!(&note[12..12 + namesz], b"SUI\0");
+    let desc_off = 12 + namesz.next_multiple_of(4);
+    let desc = &note[desc_off..desc_off + descsz];
+    let name_len = r16(&desc[0..2]) as usize;
+    assert_eq!(&desc[2..2 + name_len], RESOURCE_NAME.as_bytes());
+    assert_eq!(&desc[2 + name_len..], payload.as_slice());
+}
+
+/// Without a section header table there is nowhere to keep an unmapped note,
+/// so refuse rather than produce a binary whose payload cannot be found.
+#[test]
+fn test_elf_append_freebsd_executable_requires_section_table() {
+    let mut input = freebsd_exec_elf64();
+    input[0x28..0x30].fill(0); // e_shoff
+    input[0x3c..0x3e].fill(0); // e_shnum
+    input[0x3e..0x40].fill(0); // e_shstrndx
+
+    let mut out = Vec::new();
+    assert!(Elf::new(&input)
+        .append(RESOURCE_NAME, b"hello-freebsd", &mut out)
+        .is_err());
+}
+
+/// Shared libraries are mapped by rtld, which copes with relocated program
+/// headers, so they keep the default layout (and stay discoverable through
+/// `find_section_in_current_image`).
+#[test]
+fn test_elf_append_freebsd_shared_object_relocates_phdrs() {
+    let mut input = freebsd_exec_elf64();
+    let r16 = |b: &[u8]| u16::from_le_bytes(b[..2].try_into().unwrap());
+    let r64 = |b: &[u8]| u64::from_le_bytes(b[..8].try_into().unwrap());
+
+    // Turn the executable into a shared object by dropping its PT_INTERP.
+    let e_phoff = r64(&input[0x20..0x28]) as usize;
+    let e_phentsize = r16(&input[0x36..0x38]) as usize;
+    let e_phnum = r16(&input[0x38..0x3a]) as usize;
+    let interp = (0..e_phnum)
+        .map(|i| e_phoff + i * e_phentsize)
+        .find(|&off| u32::from_le_bytes(input[off..off + 4].try_into().unwrap()) == PT_INTERP)
+        .expect("no PT_INTERP");
+    input[interp..interp + 4].copy_from_slice(&0u32.to_le_bytes()); // PT_NULL
+
+    let mut out = Vec::new();
+    Elf::new(&input)
+        .append(RESOURCE_NAME, b"hello-freebsd-so", &mut out)
+        .unwrap();
+
+    assert!(
+        r64(&out[0x20..0x28]) as usize >= input.len(),
+        "program header table was not relocated"
+    );
+    assert_eq!(r16(&out[0x38..0x3a]) as usize, e_phnum + 2);
+}
+
+/// The test binary carries no SUI note, so the runtime lookup (including, on
+/// FreeBSD, the fallback that scans the executable file) finds nothing.
+#[cfg(all(unix, not(target_vendor = "apple")))]
+#[test]
+fn test_elf_find_section_without_note() {
+    assert!(libsui::find_section(RESOURCE_NAME).unwrap().is_none());
 }
 
 // --- SizeOfImage regression tests for the PE resource writer ---------------
